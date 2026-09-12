@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pytest-benchmark
+.benchmarks/
+
+# Model checkpoints and capture bundles -- large binaries, never committed.
+# Tests locate them at run time via SEMSIMULA_BUNDLES (see tests/conftest.py).
+*.pt
+*.pth
+*.ckpt
+*.safetensors
