@@ -21,6 +21,7 @@ repo. See [MIGRATION.md](MIGRATION.md) for what is ported so far.
 > | `probes.precision_cap` | **unverified** — needs GPU |
 > | `probes.clip_order` | **unverified** — needs GPU |
 > | `probes.integrator` | **unverified** — needs GPU |
+| `probes.tau_saturation.probe_hot_rows` | **unverified** — needs GPU (ported after the rest; same gap) |
 > | `probes.stiffness` | verified on CPU against the real step-87196 weights |
 > | `probes.tau_saturation` | verified on CPU (`tau_min` 5.22 @ register 14 matches the live log) |
 > | `probes.tokens` | verified on CPU against real bundles |

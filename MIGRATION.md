@@ -45,7 +45,8 @@ src/semsimula_diag/
     │                      replay_curvature_rebalance_ablation
     ├── clip_order.py      replay_clip_ablation
     ├── integrator.py      replay_integrator_ablation
-    ├── tau_saturation.py  probe_gate_saturation, sweep_log_tau_history
+    ├── tau_saturation.py  probe_gate_saturation, sweep_log_tau_history,
+    │                      probe_hot_rows
     ├── stiffness.py       stiffness_report, sigma_lr_report,
     │                      sigma_lr_spectrum_report, bracket_precision_lr_max,
     │                      spectrum_across_checkpoints
@@ -53,10 +54,18 @@ src/semsimula_diag/
                            decode_hot_rows
 ```
 
-The five replay-based probes share `_engine.replayed()`, which writes the
+The six replay-based probes share `_engine.replayed()`, which writes the
 snapshot / load-weights / restore-RNG / microbatch-loop / clip-then-sum /
 restore sequence **once**. In the notebook each helper re-implements it, and
 getting any step subtly wrong changes the answer without raising.
+
+`probe_hot_rows` needed two more primitives, now also in `_engine.py`:
+`patched_attrs` (restoring-guaranteed multi-attribute monkeypatching, for
+hooking the creation gate's module-level readout functions) and
+`iter_isolated_rows` (the per-row RNG-reset-and-clear loop, shared with
+`row_attribution.attribute_spike_rows`'s own per-row pass). Both are general
+enough that a later probe needing the same pattern does not have to
+reinvent it.
 
 ### ⚠️ Verification status
 
@@ -71,6 +80,7 @@ getting any step subtly wrong changes the answer without raising.
 | `probes.precision_cap` | **NO — needs GPU** |
 | `probes.clip_order` | **NO — needs GPU** |
 | `probes.integrator` | **NO — needs GPU** |
+| `probes.tau_saturation.probe_hot_rows` | **NO — needs GPU** (ported later than the rest of this table; same engine, same gap) |
 
 The replay probes have unit tests covering the engine (weight/grad/RNG
 restoration, restoration on the exception path, clip-then-sum actually

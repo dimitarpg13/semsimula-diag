@@ -16,14 +16,15 @@ from __future__ import annotations
 import contextlib
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
 from ..clipping import ClipThenSum, per_group_grad_norms
 from .context import ProbeContext
 
-__all__ = ["ReplayInfo", "replayed", "restored_model_state"]
+__all__ = ["ReplayInfo", "replayed", "restored_model_state",
+           "patched_attrs", "iter_isolated_rows"]
 
 
 @dataclass
@@ -89,6 +90,73 @@ def restored_model_state(ctx: ProbeContext, *, grads: bool = True,
         if saved_rng_cuda is not None:
             torch.cuda.set_rng_state_all(saved_rng_cuda)
         model.train(was_training)
+
+
+@contextlib.contextmanager
+def patched_attrs(obj: Any,
+                  patches: Dict[str, Callable[[Callable], Callable]]
+                  ) -> Iterator[None]:
+    """Temporarily replace several attributes on ``obj``, guaranteeing
+    restoration -- ``restored_model_state`` for arbitrary monkeypatches
+    rather than model weights/grads/RNG.
+
+    ``patches`` maps attribute name -> ``make_wrapper(original) ->
+    replacement``. Generalises the single-attribute swap
+    ``probes.stiffness`` uses internally to cover probes that need to hook
+    MULTIPLE call sites at once -- e.g.
+    :func:`~semsimula_diag.probes.tau_saturation.probe_hot_rows` patches two
+    module-level readout functions simultaneously to record their inputs
+    before delegating to the original.
+
+    Every named attribute must already exist on ``obj``; a typo or a wrong
+    module produces an ``AttributeError`` from ``getattr`` immediately,
+    rather than a hook that silently never fires.
+    """
+    originals = {name: getattr(obj, name) for name in patches}
+    try:
+        for name, make_wrapper in patches.items():
+            setattr(obj, name, make_wrapper(originals[name]))
+        yield
+    finally:
+        for name, original in originals.items():
+            setattr(obj, name, original)
+
+
+def iter_isolated_rows(
+    ctx: ProbeContext, bundle: Dict[str, Any]
+) -> Iterator[Tuple[int, int, torch.Tensor, torch.Tensor, int]]:
+    """Yield ``(microbatch_idx, row_idx, x_row, y_row, n_rows_in_microbatch)``
+    for every row in a capture, one at a time.
+
+    Before each row: the RNG stream is reset to the bundle's pinned state and
+    every parameter's ``.grad`` is cleared. Both matter -- without the RNG
+    reset, row *i*'s routing depends on how many rows already ran (the
+    stream would have been consumed by them); without the grad clear, a
+    row's ``.backward()`` would accumulate onto the previous row's gradient
+    instead of isolating its own.
+
+    This is the shared primitive behind
+    :func:`~semsimula_diag.probes.row_attribution.attribute_spike_rows` and
+    :func:`~semsimula_diag.probes.tau_saturation.probe_hot_rows`.
+
+    The caller is responsible for having loaded the bundle's weights first
+    (typically by running this *inside* an active
+    :func:`replayed` block, whose restoration has not fired yet) -- this
+    only handles the per-row RNG/grad reset, not the weight load itself.
+    """
+    model = ctx.model
+    for mb, (xb, yb) in enumerate(bundle["batches"]):
+        n_rows = xb.shape[0]
+        for row in range(n_rows):
+            torch.set_rng_state(bundle["rng_state_cpu"])
+            if (bundle.get("rng_state_cuda") is not None
+                    and ctx.device == "cuda" and torch.cuda.is_available()):
+                torch.cuda.set_rng_state_all(bundle["rng_state_cuda"])
+            for p in model.parameters():
+                p.grad = None
+            x = torch.as_tensor(xb[row:row + 1]).long().to(ctx.device)
+            y = torch.as_tensor(yb[row:row + 1]).long().to(ctx.device)
+            yield mb, row, x, y, n_rows
 
 
 def _install_layer_hook(ctx: ProbeContext, info: ReplayInfo) -> Optional[Callable]:
