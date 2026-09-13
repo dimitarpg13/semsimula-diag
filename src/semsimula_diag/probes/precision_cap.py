@@ -17,12 +17,15 @@ from __future__ import annotations
 import contextlib
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 
+import torch
+
 from ..clipping import per_group_grad_norms
 from ..report import ProbeResult
-from ._engine import replayed, restored_model_state
+from ._engine import patched_attrs, replayed, restored_model_state
 from .context import ProbeContext
 
-__all__ = ["replay_precision_cap_ablation", "replay_curvature_rebalance_ablation"]
+__all__ = ["replay_precision_cap_ablation", "replay_curvature_rebalance_ablation",
+          "replay_rank_truncation_ablation"]
 
 
 def _banks(model) -> List:
@@ -152,4 +155,133 @@ def replay_curvature_rebalance_ablation(
                     per_group=m["per_group"])
                 if verbose:
                     print(f'  {label:28s} total={m["pre_clip_grad_norm"]:10.2f}')
+    return out
+
+
+def _svd_truncate(B: torch.Tensor, rank: int) -> torch.Tensor:
+    """Reconstruct ``B`` at reduced effective rank via SVD, preserving its
+    original shape.
+
+    ``B`` has shape ``(..., d, r_full)``. Keeps only the top ``rank``
+    singular directions and zeros the rest, so the reconstruction has
+    exactly ``B``'s shape but at most ``rank`` nonzero singular values --
+    no downstream shape changes needed anywhere else in the model.
+
+    ``rank >= r_full`` is a true no-op (returns ``B`` unchanged, skipping
+    the SVD entirely) -- this is what makes a truncation ablation's own
+    ``rank = r_full`` arm a built-in fidelity check against the genuinely
+    untruncated reference.
+    """
+    if rank >= B.shape[-1]:
+        return B
+    U, S, Vh = torch.linalg.svd(B, full_matrices=False)
+    S = S.clone()
+    S[..., rank:] = 0.0
+    return U @ torch.diag_embed(S) @ Vh
+
+
+def replay_rank_truncation_ablation(
+    ctx: ProbeContext, step_tag: int,
+    ranks: Sequence[int] = (1, 2, 3, 4),
+    verbose: bool = True,
+) -> Dict[str, ProbeResult]:
+    """Does the well actually use its rank budget, or is truncating it free?
+
+    Ported from the rank-selection procedure's Stage 2 (Curvature
+    Diagnostics and Rank Selection for Aniso Gaussian V_theta, SS7.3),
+    proposed there and built here for the first time.
+
+    The participation ratio (``probes.stiffness.sigma_lr_spectrum_report``)
+    is a purely geometric statistic: it says how the well's curvature
+    *budget* is distributed across directions, not whether the small
+    directions carry any *force*. A well could have a low participation
+    ratio yet still depend functionally on its tail singular vectors, if
+    they happen to align with something the loss cares about. This probe
+    is the direct test: replay a captured batch with the realised ``B_k``
+    truncated to its rank-``r'`` SVD reconstruction, for each ``r'`` in
+    ``ranks``, and report how much the resulting gradient actually moves.
+
+    Hooks ``context_components`` -- the single point where the integrator
+    computes the realised (post-``_bound_lowrank``) well parameters once
+    per layer and reuses them for both the harmonic split and the force
+    (see the docstring on ``context_components`` itself) -- so every
+    downstream consumer for that step sees the truncated ``B`` uniformly.
+
+    Args:
+        ranks: SVD ranks to truncate to. The default follows the note's
+            proposed signature; a value ``>=`` the model's actual rank is a
+            no-op (see :func:`_svd_truncate`) and only costs the fidelity
+            check, not a real ablation.
+
+    Returns a dict keyed ``"full (untruncated)"`` plus one entry per rank in
+    ``ranks``, each a :class:`ProbeResult` with ``metrics['rank']``,
+    ``metrics['pre_clip_grad_norm']``, ``metrics['ntp']``, and the decisive
+    reading, ``metrics['relative_force_error']`` -- ``||g_trunc - g_full|| /
+    ||g_full||`` over the full flattened parameter-gradient vector. A
+    truncation that leaves this near zero means the truncated directions
+    were dead weight; a truncation that moves it substantially means they
+    were carrying real signal.
+
+    **Scope note.** "Force" here is the parameter gradient the training
+    loss produces through the truncated well, not a separately-captured
+    per-position ``h``-space force field -- cheaper to compute, reuses the
+    same replay machinery as every other ablation in this module, and
+    answers the question the note actually poses: does truncating rank
+    change what the optimizer would have done.
+    """
+    ctx.require("store", "clip_cfg", "forward_fn")
+    bundle, path = ctx.store.load(step_tag)
+    if verbose:
+        print(f'[ranktrunc] loaded {path.name}  step={bundle["step"]}  '
+              f'pre_clip_grad_norm={bundle.get("pre_clip_grad_norm")}')
+
+    def _flat_grad(model) -> torch.Tensor:
+        return torch.cat([p.grad.detach().flatten()
+                          for p in model.parameters() if p.grad is not None])
+
+    def _measure(rank: Optional[int]):
+        if rank is None:
+            cm: contextlib.AbstractContextManager = contextlib.nullcontext()
+        else:
+            def _make_wrapper(original):
+                def _wrapped(xis):
+                    comps = original(xis)
+                    return [(mu, a, w, _svd_truncate(B, rank) if B.shape[-1] else B)
+                            for (mu, a, w, B) in comps]
+                return _wrapped
+            cm = patched_attrs(ctx.model.V_theta,
+                               {"context_components": _make_wrapper})
+        with cm:
+            with replayed(ctx, bundle) as info:
+                pg = per_group_grad_norms(ctx.model, ctx.clip_cfg)
+                excl = ctx.clip_cfg.watchdog_exclude_groups
+                total = sum(v * v for k, v in pg.items() if k not in excl) ** 0.5
+                grad_vec = _flat_grad(ctx.model)
+                ntp = info.ntp
+        return total, ntp, grad_vec, pg
+
+    out: Dict[str, ProbeResult] = {}
+    with restored_model_state(ctx, grads=False, weights=False, rng=False):
+        full_total, full_ntp, full_grad, full_pg = _measure(None)
+        full_norm = float(full_grad.norm()) or 1e-12
+        out["full (untruncated)"] = ProbeResult(
+            probe_name="rank_truncation", step_tag=bundle.get("step", step_tag),
+            metrics={"rank": float("inf"), "pre_clip_grad_norm": full_total,
+                     "ntp": full_ntp, "relative_force_error": 0.0},
+            per_group=full_pg)
+        if verbose:
+            print(f'  {"full (untruncated)":20s} total={full_total:10.2f}  '
+                  f'ntp={full_ntp:.4f}')
+
+        for r in ranks:
+            total, ntp, grad_vec, pg = _measure(r)
+            rel_err = float((grad_vec - full_grad).norm() / full_norm)
+            out[f"rank={r}"] = ProbeResult(
+                probe_name="rank_truncation", step_tag=bundle.get("step", step_tag),
+                metrics={"rank": r, "pre_clip_grad_norm": total, "ntp": ntp,
+                         "relative_force_error": rel_err},
+                per_group=pg)
+            if verbose:
+                print(f'  rank={r:<16d} total={total:10.2f}  ntp={ntp:.4f}  '
+                      f'relative_force_error={rel_err:.4f}')
     return out

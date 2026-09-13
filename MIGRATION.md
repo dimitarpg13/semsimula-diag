@@ -42,7 +42,8 @@ src/semsimula_diag/
     ├── layer_profile.py   replay_spike_batch
     ├── row_attribution.py attribute_spike_rows
     ├── precision_cap.py   replay_precision_cap_ablation,
-    │                      replay_curvature_rebalance_ablation
+    │                      replay_curvature_rebalance_ablation,
+    │                      replay_rank_truncation_ablation
     ├── clip_order.py      replay_clip_ablation
     ├── integrator.py      replay_integrator_ablation
     ├── tau_saturation.py  probe_gate_saturation, sweep_log_tau_history,
@@ -81,6 +82,7 @@ reinvent it.
 | `probes.clip_order` | **NO — needs GPU** |
 | `probes.integrator` | **NO — needs GPU** |
 | `probes.tau_saturation.probe_hot_rows` | **NO — needs GPU** (ported later than the rest of this table; same engine, same gap) |
+| `probes.precision_cap.replay_rank_truncation_ablation` | **NO — needs GPU** (built 2026-09-13, was proposed-only in the companion note until now; same gap) |
 
 The replay probes have unit tests covering the engine (weight/grad/RNG
 restoration, restoration on the exception path, clip-then-sum actually
