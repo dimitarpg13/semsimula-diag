@@ -384,3 +384,84 @@ def test_monitor_is_immune_to_repeated_layer_step_entry(tmp_path):
     # exactly one cell per (microbatch, layer) despite the doubled entry
     assert set(mon.by_mb_layer) == {(mb, li) for mb in range(n_mb)
                                     for li in range(3)}, sorted(mon.by_mb_layer)
+
+
+# --- per-site PR breakdown (rank-allocation decision) -------------------
+
+def _pr_toy(n_layers=3, d=6, vocab=16, K=2, r=3):
+    class _V(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.K, self.d, self.r = K, d, r
+            self.proj = nn.Linear(d, K * d * r, bias=False)
+            self.scale = nn.Parameter(torch.ones(n_layers), requires_grad=False)
+            self.layer = 0
+        def context_components(self, xis):
+            B = self.proj(xis).reshape(*xis.shape[:-1], self.K, self.d, self.r)
+            # make site (layer, channel) identity matter: channel 1 is
+            # deliberately concentrated, so PR must differ between channels
+            z = torch.zeros(*B.shape[:-1])
+            out = []
+            for ch in range(2):
+                Bc = B.clone()
+                if ch == 1:
+                    Bc[..., 1:] *= 0.02          # near rank-1 -> low PR
+                out.append((z, z + 1.0, z[..., :1].squeeze(-1) + 1.0, Bc))
+            return out
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = nn.Embedding(vocab, d)
+            self.V_theta = _V()
+            self.head = nn.Linear(d, vocab)
+            self.n_layers = n_layers
+        def _fock_layer_step(self, h, h_prev, r_, sal, m_b, g, dt, layer_idx,
+                             *a, **kw):
+            self.V_theta.context_components(h)
+            return torch.tanh(h), h
+        def forward(self, x):
+            h = self.emb(x); hp = h
+            for li in range(self.n_layers):
+                h, hp = self._fock_layer_step(h, hp, None, None, None, None,
+                                              1.0, li)
+            return self.head(h)
+    return _M()
+
+
+def _pr_ctx(model, tmp_path):
+    return ProbeContext(model=model, device="cpu",
+                        clip_cfg=GradClipConfig(default_clip=1.0))
+
+
+def test_per_site_pr_separates_channels(tmp_path):
+    """The pooled report cannot say whether a wide PR spread is structure or
+    noise. This one must: channel 1 is built near rank-1, channel 0 is not."""
+    from semsimula_diag.probes import stiffness
+    torch.manual_seed(0)
+    model = _pr_toy()
+    ctx = _pr_ctx(model, tmp_path)
+    x = torch.randint(0, 16, (2, 5))
+    res = stiffness.sigma_lr_spectrum_by_site(ctx, x, verbose=False)
+
+    med = res.raw["site_medians"]
+    assert res.metrics["n_sites"] == 6, med          # 3 layers x 2 channels
+    ch0 = [v for k, v in med.items() if k.endswith("c0")]
+    ch1 = [v for k, v in med.items() if k.endswith("c1")]
+    assert min(ch0) > max(ch1), (ch0, ch1)           # channel 1 is concentrated
+    assert res.metrics["between_frac"] > 0.5         # and it reads as STRUCTURE
+
+
+def test_per_site_pr_refuses_without_a_layer_index(tmp_path):
+    """Without _fock_layer_step every site would be recorded as layer 0 --
+    exactly the pooling this probe exists to avoid, so it must not guess."""
+    from semsimula_diag.probes import stiffness
+    model = _pr_toy()
+    del model.__class__._fock_layer_step
+    try:
+        with pytest.raises(RuntimeError, match="_fock_layer_step"):
+            stiffness.sigma_lr_spectrum_by_site(
+                _pr_ctx(model, tmp_path), torch.randint(0, 16, (2, 5)),
+                verbose=False)
+    finally:
+        pass

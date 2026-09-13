@@ -315,8 +315,11 @@ truncation changes two things at once and the occupancy term can dominate.
 That caveat applies to `replay_rank_truncation_ablation` too.
 
 
-D2 and D2b of
-`semsimula-paper/companion_notes/Resonance_Hypothesis_for_Gradient_Spikes_in_the_LowRank_Kick.md`.
+D2 and D2b of the resonance-hypothesis note, now superseded by
+`semsimula-paper/companion_notes/Gradient_Spikes_as_Routing_Conjunctions.md`,
+which establishes that a spike is a conjunction between one microbatch and
+the routing draw it receives -- resetting the RNG per microbatch collapses
+every captured spike to baseline (937x / 576x / 264x across three captures).
 
 Unlike every other probe here this one is not a replay ablation: `omega*dt`
 exists during the forward pass, before a gradient does, so it is a *leading*

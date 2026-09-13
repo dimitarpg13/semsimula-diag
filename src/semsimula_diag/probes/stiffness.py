@@ -23,12 +23,14 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 import torch
 
 from ..report import ProbeResult
+from ._engine import patched_attrs
 from .context import ProbeContext
 
 __all__ = [
     "stiffness_report",
     "sigma_lr_report",
     "sigma_lr_spectrum_report",
+    "sigma_lr_spectrum_by_site",
     "bracket_precision_lr_max",
     "spectrum_across_checkpoints",
 ]
@@ -339,3 +341,105 @@ def bracket_precision_lr_max(
             reports[f"spike step {tag}"] = res
             del data
     return reports
+
+
+def sigma_lr_spectrum_by_site(ctx: ProbeContext, x: torch.Tensor,
+                              verbose: bool = True) -> ProbeResult:
+    """Participation ratio broken out by (layer, channel), not pooled.
+
+    :func:`sigma_lr_spectrum_report` reports global quantiles, which answer
+    "is the rank budget used?" but not "is it used evenly?". Those are
+    different decisions: a uniform PR justifies raising the single global
+    rank, whereas a PR that is high in some banks and low in others argues
+    for a per-bank allocation instead, since one global value then
+    over-serves the saturated sites and under-serves the rest.
+
+    The reported discriminator is a variance decomposition. ``between_std``
+    is the spread of the per-site medians -- structure. ``within_std`` is
+    the typical spread of wells inside a site -- noise. A ``between_frac``
+    near 0 means the population is homogeneous and the pooled quantiles
+    were telling the whole story; near 1 means the spread is organised by
+    site and a global rank is the wrong instrument.
+
+    Requires the model to expose ``_fock_layer_step``: without a true layer
+    index every site would collapse into one, which is the failure mode
+    this probe exists to avoid, so it raises rather than guessing.
+    """
+    model = ctx.model
+    _require_aniso(model, "context_components")
+    if not hasattr(model, "_fock_layer_step"):
+        raise RuntimeError(
+            "model exposes no _fock_layer_step, so the layer index cannot be "
+            "recovered and every site would be recorded as layer 0. Use "
+            "sigma_lr_spectrum_report for the pooled view instead.")
+
+    sites: Dict[tuple, List[torch.Tensor]] = {}
+    cur = {"layer": 0}
+
+    def _wrap_layer(original):
+        def _w(h, h_prev, r, salience, m_b, gamma, dt, layer_idx, *a, **kw):
+            cur["layer"] = layer_idx
+            return original(h, h_prev, r, salience, m_b, gamma, dt,
+                            layer_idx, *a, **kw)
+        return _w
+
+    def _wrap_comps(original):
+        def _w(xis):
+            comps = original(xis)
+            for ch, (_mu, _a, _w_, B) in enumerate(comps):
+                if B.shape[-1] == 0:
+                    continue
+                sv = torch.linalg.svdvals(B.detach())
+                sv = sv.float().reshape(-1, sv.shape[-1]).cpu().double()
+                s2 = sv ** 2
+                pr = (s2.sum(-1) ** 2) / (s2 ** 2).sum(-1).clamp(min=1e-300)
+                sites.setdefault((cur["layer"], ch), []).append(pr)
+            return comps
+        return _w
+
+    with patched_attrs(model, {"_fock_layer_step": _wrap_layer}):
+        with patched_attrs(model.V_theta, {"context_components": _wrap_comps}):
+            with _eval_mode(model):
+                with torch.no_grad():
+                    model(x)
+
+    if not sites:
+        return ProbeResult(probe_name="sigma_lr_spectrum_by_site",
+                           metrics={"n_sites": 0})
+
+    per_site = {k: torch.cat(v) for k, v in sorted(sites.items())}
+    medians = torch.tensor([v.median() for v in per_site.values()],
+                           dtype=torch.float64)
+    within = torch.tensor([v.std() for v in per_site.values()],
+                          dtype=torch.float64)
+    between_std, within_std = float(medians.std()), float(within.mean())
+    frac = between_std ** 2 / max(between_std ** 2 + within_std ** 2, 1e-300)
+
+    if verbose:
+        n_ch = 1 + max(k[1] for k in per_site)
+        print(f"PR by (layer, channel) -- {len(per_site)} sites\n")
+        print(f"{'layer':>6}" + "".join(f"{f'ch{c}':>9}" for c in range(n_ch)))
+        for li in sorted({k[0] for k in per_site}):
+            row = "".join(f"{float(per_site[(li, c)].median()):>9.2f}"
+                          if (li, c) in per_site else f"{'--':>9}"
+                          for c in range(n_ch))
+            print(f"{li:>6}{row}")
+        print("")
+        print(f"site medians: min {float(medians.min()):.2f}  "
+              f"max {float(medians.max()):.2f}  "
+              f"spread {float(medians.max() - medians.min()):.2f}")
+        print(f"between-site std {between_std:.3f} | within-site std {within_std:.3f}"
+              f" | between_frac {frac:.2f}")
+        print("  -> " + ("STRUCTURED: per-bank rank is the better instrument"
+                         if frac > 0.5 else
+                         "HOMOGENEOUS: a single global rank is appropriate"))
+
+    return ProbeResult(
+        probe_name="sigma_lr_spectrum_by_site",
+        metrics={"n_sites": len(per_site),
+                 "site_median_min": float(medians.min()),
+                 "site_median_max": float(medians.max()),
+                 "between_std": between_std, "within_std": within_std,
+                 "between_frac": frac},
+        raw={"site_medians": {f"L{k[0]}c{k[1]}": float(v.median())
+                              for k, v in per_site.items()}})
