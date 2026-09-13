@@ -14,6 +14,7 @@ Centralising it means the sequence is written (and tested) once.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -24,7 +25,8 @@ from ..clipping import ClipThenSum, per_group_grad_norms
 from .context import ProbeContext
 
 __all__ = ["ReplayInfo", "replayed", "restored_model_state",
-           "patched_attrs", "assert_unpatched", "iter_isolated_rows"]
+           "patched_attrs", "assert_unpatched", "iter_isolated_rows",
+           "CURRENT_MICROBATCH"]
 
 
 @dataclass
@@ -96,6 +98,15 @@ def restored_model_state(ctx: ProbeContext, *, grads: bool = True,
         if saved_rng_cuda is not None:
             torch.cuda.set_rng_state_all(saved_rng_cuda)
         model.train(was_training)
+
+
+# The microbatch `replayed` is currently on. Hooks installed by other probes
+# (notably probes.resonance) need it and cannot reconstruct it: under gradient
+# checkpointing the layer step is re-entered on recompute, so counting layer
+# wraparounds over-counts badly -- measured 3 calls per (microbatch, layer) on
+# the deployed model, which inferred 12 microbatches where there were 4.
+CURRENT_MICROBATCH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
+    "semsimula_diag_microbatch", default=0)
 
 
 _ACTIVE_PATCHES = "_semsimula_diag_active_patches"
@@ -337,6 +348,7 @@ def replayed(ctx: ProbeContext, bundle: Dict[str, Any], *,
 
             for i, (xb, yb) in enumerate(bundle["batches"]):
                 info.microbatch = i
+                CURRENT_MICROBATCH.set(i)
                 # bundles store numpy arrays, not tensors
                 x = torch.as_tensor(xb).long().to(ctx.device)
                 y = torch.as_tensor(yb).long().to(ctx.device)

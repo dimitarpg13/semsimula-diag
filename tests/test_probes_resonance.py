@@ -339,3 +339,48 @@ def test_monitor_separates_microbatches_and_layers(tmp_path):
     assert keys == {(mb, li) for mb in range(n_mb) for li in range(3)}, keys
     # and the flat view really does pool them, which is why it was misleading
     assert set(mon.per_layer) == {0, 1, 2}
+
+
+def test_monitor_is_immune_to_repeated_layer_step_entry(tmp_path):
+    """Under gradient checkpointing the layer step is re-entered on recompute:
+    measured 3 calls per (microbatch, layer) on the deployed model, and 5
+    cfc_substep calls. A monitor that counted layer-0 wraparounds inferred 12
+    microbatches where there were 4. The index must come from the engine, and
+    only the first (forward) reading per cell may be kept."""
+    torch.manual_seed(0)
+
+    class _Reentrant(_LayeredToy):
+        def _fock_layer_step(self, h, h_prev, r, salience, m_b, gamma, dt,
+                             layer_idx, *a, **kw):
+            out = super()._fock_layer_step(h, h_prev, r, salience, m_b,
+                                           gamma, dt, layer_idx, *a, **kw)
+            # re-enter exactly as a checkpoint recompute would
+            super()._fock_layer_step(h, h_prev, r, salience, m_b, gamma, dt,
+                                     layer_idx, *a, **kw)
+            return out
+
+    model = _Reentrant(n_layers=3)
+    rng = np.random.RandomState(0)
+    n_mb = 3
+    batches = [(r, r) for r in
+               (rng.randint(0, 16, (2, 5)).astype(np.int64) for _ in range(n_mb))]
+    bundle = {"step": 11, "grad_accum": n_mb, "batches": batches,
+              "model_state_dict": model.state_dict(),
+              "rng_state_cpu": torch.get_rng_state(), "rng_state_cuda": None,
+              "pre_clip_grad_norm": 1.0, "top_groups": {}}
+    ck = tmp_path / "re"; ck.mkdir()
+    torch.save(bundle, ck / "run_step11_spikebatch.pt")
+    ctx = ProbeContext(
+        model=model, device="cpu",
+        store=BundleStore(ckpt_dir=ck, ckpt_prefix="run", archive_root=tmp_path,
+                          verbose=False),
+        clip_cfg=GradClipConfig(default_clip=10.0), forward_fn=_forward_fn)
+
+    from semsimula_diag.probes import replayed, restored_model_state
+    with resonance.observe(model, _FakeIntegratorModule) as mon:
+        with restored_model_state(ctx, grads=False, weights=False, rng=False):
+            with replayed(ctx, bundle):
+                pass
+    # exactly one cell per (microbatch, layer) despite the doubled entry
+    assert set(mon.by_mb_layer) == {(mb, li) for mb in range(n_mb)
+                                    for li in range(3)}, sorted(mon.by_mb_layer)

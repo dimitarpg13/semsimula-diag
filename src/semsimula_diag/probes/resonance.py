@@ -36,7 +36,8 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence
 import torch
 
 from ..report import ProbeResult
-from ._engine import patched_attrs, replayed, restored_model_state
+from ._engine import (CURRENT_MICROBATCH, patched_attrs, replayed,
+                      restored_model_state)
 from .precision_cap import _svd_truncate
 from .context import ProbeContext
 
@@ -105,8 +106,8 @@ class ResonanceMonitor:
         self.by_mb_layer: Dict[tuple, torch.Tensor] = {}
         self._pending: Optional[torch.Tensor] = None
         self._layer = 0
-        self._mb = 0
-        self._seen_layer0 = False
+        self._have_layer_idx = False
+        self._fallback_layer = 0
         self.dt_substep: Optional[float] = None
 
     def _stash(self, lam: torch.Tensor) -> None:
@@ -127,23 +128,32 @@ class ResonanceMonitor:
         m_flat = m_b.squeeze(-1) if m_b.shape[-1] == 1 else m_b
         omega = (self._pending / m_flat.clamp(min=1e-30)).clamp(min=0).sqrt()
         vals = (omega * dt_kick).detach().flatten().cpu()
-        self.per_layer.setdefault(self._layer, []).append(vals)
-        self.by_mb_layer[(self._mb, self._layer)] = vals
+        if self._have_layer_idx:
+            layer = self._layer
+        else:                       # no _fock_layer_step to read an index from
+            layer = self._fallback_layer
+            self._fallback_layer += 1
+        mb = CURRENT_MICROBATCH.get()
+        # setdefault, not assignment: the layer step is re-entered on the
+        # gradient-checkpoint recompute, and the FIRST reading is the forward
+        # pass. Overwriting would silently report recompute values instead.
+        if (mb, layer) not in self.by_mb_layer:
+            self.by_mb_layer[(mb, layer)] = vals
+            self.per_layer.setdefault(layer, []).append(vals)
         self._pending = None
-        self._layer += 1
 
     def note_layer(self, layer_idx: int) -> None:
-        """Called from the `_fock_layer_step` hook, which is the only place
-        the true layer index is available -- neither `harmonic_terms` nor
-        `cfc_substep` receives it. A wrap back to layer 0 marks a new
-        microbatch."""
-        if layer_idx == 0 and self._seen_layer0:
-            self._mb += 1
-        self._seen_layer0 = True
-        self._layer = layer_idx
+        """Record which layer the step about to run belongs to.
 
-    def reset_layer_counter(self) -> None:
-        self._layer = 0
+        The `_fock_layer_step` hook is the only place the true index is
+        available -- neither `harmonic_terms` nor `cfc_substep` receives one.
+        The microbatch is NOT inferred here; it comes from the engine's
+        `CURRENT_MICROBATCH`, because this hook fires several times per
+        (microbatch, layer) under gradient checkpointing and any counting
+        rule based on it over-counts.
+        """
+        self._have_layer_idx = True
+        self._layer = layer_idx
 
     def summary(self) -> Dict[str, Any]:
         """Percentiles of ``omega*dt`` overall and per layer, plus the
