@@ -171,13 +171,30 @@ def _svd_truncate(B: torch.Tensor, rank: int) -> torch.Tensor:
     the SVD entirely) -- this is what makes a truncation ablation's own
     ``rank = r_full`` arm a built-in fidelity check against the genuinely
     untruncated reference.
+
+    **Why the SVD itself runs on CPU.** ``B`` is a batch of many small
+    matrices (one per well), and this call sits inside the forward pass
+    under autograd, so every element of ``ranks`` differentiates through
+    it once per microbatch. cuSOLVER's batched SVD backward is known to be
+    dramatically slower than CPU LAPACK's for exactly this shape (many
+    small matrices), and the truncation makes it worse: forcing the tail
+    singular values to an identical 0.0 creates repeated singular values,
+    and the SVD backward formula divides by pairwise differences between
+    them -- a ``0/0`` for every such pair. CPU LAPACK's implementation
+    tolerates that near-degenerate case at a survivable cost; cuSOLVER's
+    batched routine does not. Moving only the decomposition to CPU (a
+    differentiable device transfer, so gradients still flow back to
+    ``B`` on its original device) keeps the ablation's semantics
+    unchanged while avoiding both the slowdown and the degeneracy this
+    truncation deliberately introduces.
     """
     if rank >= B.shape[-1]:
         return B
-    U, S, Vh = torch.linalg.svd(B, full_matrices=False)
+    orig_device = B.device
+    U, S, Vh = torch.linalg.svd(B.cpu(), full_matrices=False)
     S = S.clone()
     S[..., rank:] = 0.0
-    return U @ torch.diag_embed(S) @ Vh
+    return (U @ torch.diag_embed(S) @ Vh).to(orig_device)
 
 
 def replay_rank_truncation_ablation(
