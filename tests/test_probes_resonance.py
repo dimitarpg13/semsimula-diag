@@ -240,3 +240,63 @@ def test_omega_dt_under_truncation_reports_both_arms(setup):
     # truncation removes curvature, so it can only lower lambda_max
     assert trunc <= full + 1e-6
     assert trunc < full          # and on a non-degenerate toy, strictly
+
+
+class _LayeredToy(nn.Module):
+    """Exposes `_fock_layer_step` with the signature `_install_layer_hook`
+    wraps, so the per-layer path is actually exercised."""
+
+    def __init__(self, n_layers=3, d=6, vocab=16):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, d)
+        self.steps = nn.ModuleList(nn.Linear(d, d) for _ in range(n_layers))
+        self.head = nn.Linear(d, vocab)
+        self.n_layers = n_layers
+
+    def _fock_layer_step(self, h, h_prev, r, salience, m_b, gamma, dt,
+                         layer_idx, *a, **kw):
+        return torch.tanh(self.steps[layer_idx](h)), h
+
+    def forward(self, x):
+        h = self.emb(x)
+        h_prev = h
+        for li in range(self.n_layers):
+            h, h_prev = self._fock_layer_step(
+                h, h_prev, None, None, None, None, 1.0, li)
+        return self.head(h)
+
+
+def test_per_layer_profile_is_recorded_for_every_microbatch(tmp_path):
+    """A spike can live in any microbatch -- at step 87196 microbatch 2 held
+    99.94% of the gradient while microbatch 0 held 0.05%, so a profile keyed
+    only by layer (first-microbatch-wins) describes whichever pass ran first,
+    not the one that spiked."""
+    from semsimula_diag.probes import replayed, restored_model_state
+    torch.manual_seed(0)
+    model = _LayeredToy()
+    rng = np.random.RandomState(0)
+    batches = [(r, r) for r in
+               (rng.randint(0, 16, (2, 5)).astype(np.int64) for _ in range(3))]
+    bundle = {"step": 7, "grad_accum": 3, "batches": batches,
+              "model_state_dict": model.state_dict(),
+              "rng_state_cpu": torch.get_rng_state(), "rng_state_cuda": None,
+              "pre_clip_grad_norm": 1.0, "top_groups": {}}
+    ck = tmp_path / "mb"; ck.mkdir()
+    torch.save(bundle, ck / "run_step7_spikebatch.pt")
+    ctx = ProbeContext(
+        model=model, device="cpu",
+        store=BundleStore(ckpt_dir=ck, ckpt_prefix="run", archive_root=tmp_path,
+                          verbose=False),
+        clip_cfg=GradClipConfig(default_clip=10.0), forward_fn=_forward_fn)
+
+    with restored_model_state(ctx, grads=False, weights=False, rng=False):
+        with replayed(ctx, bundle, per_layer=True) as info:
+            pass
+
+    assert set(info.per_layer_by_mb) == {0, 1, 2}, info.per_layer_by_mb
+    for mb, prof in info.per_layer_by_mb.items():
+        assert set(prof) == {0, 1, 2}, (mb, prof)
+    # microbatches genuinely differ -- otherwise the test proves nothing
+    assert info.per_layer_by_mb[0] != info.per_layer_by_mb[2]
+    # the legacy field still holds microbatch 0, unchanged
+    assert info.per_layer_h_grad == info.per_layer_by_mb[0]

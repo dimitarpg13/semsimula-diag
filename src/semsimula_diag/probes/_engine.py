@@ -38,6 +38,12 @@ class ReplayInfo:
     v_reg: float = 0.0
     fock_reg: float = 0.0
     per_layer_h_grad: Dict[int, float] = field(default_factory=dict)
+    # per_layer_h_grad keeps only the FIRST microbatch (setdefault), which is
+    # wrong whenever a spike lives in a later one -- at step 87196 microbatch 2
+    # carried 99.94% of the gradient and microbatch 0 carried 0.05%, so a
+    # profile read from it described an innocent pass. This keeps every one.
+    per_layer_by_mb: Dict[int, Dict[int, float]] = field(default_factory=dict)
+    microbatch: int = 0
     clip_then_sum_groups: List[str] = field(default_factory=list)
 
     def replayed_total(self, ctx: ProbeContext) -> float:
@@ -232,7 +238,9 @@ def _install_layer_hook(ctx: ProbeContext, info: ReplayInfo) -> Optional[Callabl
                 # non-None tensor-hook return as a gradient replacement, and
                 # setdefault returns a float -> "expected Variable, but hook
                 # returned 'float'".
-                info.per_layer_h_grad.setdefault(li, float(g.detach().norm()))
+                n = float(g.detach().norm())
+                info.per_layer_h_grad.setdefault(li, n)
+                info.per_layer_by_mb.setdefault(info.microbatch, {}).setdefault(li, n)
             h_new.register_hook(_hook)
         return out
 
@@ -328,6 +336,7 @@ def replayed(ctx: ProbeContext, bundle: Dict[str, Any], *,
             info.clip_then_sum_groups = sorted(cts.params)
 
             for i, (xb, yb) in enumerate(bundle["batches"]):
+                info.microbatch = i
                 # bundles store numpy arrays, not tensors
                 x = torch.as_tensor(xb).long().to(ctx.device)
                 y = torch.as_tensor(yb).long().to(ctx.device)
