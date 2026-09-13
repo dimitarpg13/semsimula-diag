@@ -127,6 +127,39 @@ vectors/values *without raising*". The aborted run's `rank=1` and
 the gradient norm collapsed 2539 -> ~2.9; those numbers were discarded
 rather than trusted, and the ablation should be re-run from scratch.
 
+### cuSOLVER refuses the batched 4x4 eigh (CUDA 13.0)
+
+With the Gram projector in place the untruncated arm reproduced the
+bundle's recorded `pre_clip_grad_norm` exactly (2539.20 vs 2539.2) in
+seconds rather than hours, confirming both the fix and replay fidelity.
+The `rank=1` arm then failed:
+
+```
+_LinAlgError: cusolver error: CUSOLVER_STATUS_INVALID_VALUE, when calling
+`cusolverDnXsyevBatched_bufferSize(...)`
+```
+
+The failure is in the *workspace-sizing* call, which runs before any
+matrix element is read, so the "may appear if the input matrix contains
+NaN" hint PyTorch appends to every cuSOLVER error does not apply: this is
+parameter validation declining 32,768 batched 4x4 problems on CUDA 13.0,
+not bad data. (The untruncated arm's exact fidelity independently rules
+out corrupt inputs.)
+
+Fixed by running only the decomposition on CPU: both matmuls stay on the
+accelerator and just the Gram matrix crosses the bus -- 2.1 MB, against
+201 MB for `B` itself. Measured ~68 ms per call, ~32 s across a four-rank
+ablation.
+
+This is not a relapse into the CPU fallback that `cfc_baoab.py` warns
+about. That warning is about decomposing `d x m` matrices, which the Gram
+reduction has already eliminated, and about a *conditional* fallback whose
+branch may differ between a forward pass and its checkpoint recompute --
+the routing here is unconditional, so no branch exists to diverge. A
+`torch.isfinite` guard on the Gram matrix now distinguishes a genuine
+NaN from this parameter rejection, at no extra cost since the transfer
+already forces a sync.
+
 ### Interrupting a replay poisons the kernel (`assert_unpatched`)
 
 The follow-up attempt surfaced a second, independent hazard. After the

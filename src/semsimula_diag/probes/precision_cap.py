@@ -208,15 +208,42 @@ def _svd_truncate(B: torch.Tensor, rank: int) -> torch.Tensor:
     is the intended reading of the ablation -- project the realised well
     onto its leading directions and ask what the optimizer would then have
     seen.
+
+    **Why the r x r eigh runs on CPU, when the d x r SVD must not.**
+    cuSOLVER rejects this batch outright on CUDA 13.0, failing in
+    ``cusolverDnXsyevBatched_bufferSize`` -- the workspace-sizing call,
+    which runs before any matrix element is read, so despite the generic
+    "may appear if the input matrix contains NaN" hint attached to every
+    cuSOLVER error, this is parameter validation refusing 32,768 batched
+    4x4 problems, not bad data. Routing just the decomposition to CPU
+    sidesteps the batched eigensolver entirely.
+
+    This is emphatically not the CPU fallback ``cfc_baoab.py`` warns
+    about, for three reasons. That warning concerns decomposing ``d x m``
+    matrices, and the Gram reduction above has already shrunk the problem
+    to ``r x r``; only the Gram matrix crosses the bus (2.1 MB at the
+    deployed shape, against 201 MB for ``B`` itself), with both matmuls
+    staying on the accelerator; and the routing here is unconditional,
+    whereas that warning is really about a *conditional* fallback whose
+    branch can differ between a forward pass and its checkpoint recompute.
+    Measured at the deployed shape, the eigh costs ~68 ms per call and
+    ~32 s across a four-rank ablation.
     """
     if rank >= B.shape[-1]:
         return B
     with torch.no_grad():
-        gram = B.transpose(-2, -1) @ B
-        # eigh returns ascending eigenvalues, so the top `rank` directions
+        gram = B.transpose(-2, -1) @ B          # (..., r, r), stays on device
+        gram_cpu = gram.cpu()
+        if not torch.isfinite(gram_cpu).all():
+            raise RuntimeError(
+                "non-finite Gram matrix B^T B in rank truncation: the "
+                "replayed well parameters are already corrupt before any "
+                "truncation is applied, so the ablation would measure "
+                "noise. Check the untruncated arm's fidelity first.")
+        # eigh gives ascending eigenvalues, so the top `rank` directions
         # are the trailing columns.
-        _, evecs = torch.linalg.eigh(gram)
-        v_top = evecs[..., -rank:]
+        _, evecs = torch.linalg.eigh(gram_cpu)
+        v_top = evecs[..., -rank:].to(B.device)
         projector = v_top @ v_top.transpose(-2, -1)
     return B @ projector
 
