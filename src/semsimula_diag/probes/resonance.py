@@ -31,15 +31,17 @@ layer actually used, rather than assuming them.
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import torch
 
 from ..report import ProbeResult
 from ._engine import patched_attrs, replayed, restored_model_state
+from .precision_cap import _svd_truncate
 from .context import ProbeContext
 
-__all__ = ["observe", "omega_dt_report", "tail_coherence_report"]
+__all__ = ["observe", "omega_dt_report", "omega_dt_under_truncation",
+           "tail_coherence_report"]
 
 _SEED = 20260913
 
@@ -321,3 +323,73 @@ def tail_coherence_report(
               f'p95={m["tail_mean_abs_cos_p95"]:.4f}')
     return ProbeResult(probe_name="tail_coherence",
                        step_tag=bundle.get("step", step_tag), metrics=m)
+
+
+def omega_dt_under_truncation(
+    ctx: ProbeContext, step_tag: int, integrator_module,
+    ranks: Sequence[int] = (3,),
+    *, wall: float = 2.0, n_power_iter: int = 24, verbose: bool = True,
+) -> Dict[str, ProbeResult]:
+    """The decisive within-bundle test: does the truncation that kills the
+    spike also carry ``omega*dt`` back under the wall?
+
+    Every spikebatch bundle is a spike capture by construction -- the
+    watchdog is what triggers the save -- so there is no "healthy" bundle to
+    contrast against. This supplies the contrast from inside one capture
+    instead, and it is a sharper test than a cross-checkpoint comparison
+    because nothing varies but the truncation.
+
+    The mechanism predicts a specific pairing, and both halves have to hold:
+    the untruncated arm reads above ``wall`` and the truncated arm reads
+    below it, in the same bundle, at the same tokens and layers. A
+    truncation that annihilates the gradient while leaving ``omega*dt``
+    unchanged would falsify the account outright -- the gradient would have
+    collapsed for some reason having nothing to do with the stability wall.
+    """
+    ctx.require("store", "forward_fn")
+    bundle, path = ctx.store.load(step_tag)
+    if verbose:
+        print(f'[omega/trunc] loaded {path.name}  step={bundle["step"]}')
+
+    def _run(rank: Optional[int]) -> Dict[str, Any]:
+        if rank is None:
+            cm: contextlib.AbstractContextManager = contextlib.nullcontext()
+        else:
+            def _make(original):
+                def _wrapped(xis):
+                    return [(mu, a, w,
+                             _svd_truncate(B, rank) if B.shape[-1] else B)
+                            for (mu, a, w, B) in original(xis)]
+                return _wrapped
+            cm = patched_attrs(ctx.model.V_theta,
+                               {"context_components": _make})
+        with cm:
+            with observe(ctx.model, integrator_module, wall=wall,
+                         n_power_iter=n_power_iter) as mon:
+                with replayed(ctx, bundle):
+                    pass
+        return mon.summary()
+
+    out: Dict[str, ProbeResult] = {}
+    with restored_model_state(ctx, grads=False, weights=False, rng=False):
+        for label, rank in [("untruncated", None)] + [(f"rank={r}", r)
+                                                      for r in ranks]:
+            s = _run(rank)
+            if not s:
+                raise RuntimeError(
+                    "no omega*dt recorded -- V_theta.harmonic_terms was "
+                    "never called, so the model is probably not running "
+                    "integrator='baoab_cfc'.")
+            out[label] = ProbeResult(
+                probe_name="omega_dt_truncation",
+                step_tag=bundle.get("step", step_tag),
+                metrics={"omega_dt_p50": s["overall"]["p50"],
+                         "omega_dt_p95": s["overall"]["p95"],
+                         "omega_dt_max": s["overall"]["max"],
+                         "frac_over_wall": s["frac_over_wall"], "wall": wall},
+                per_layer={k: v["max"] for k, v in s["per_layer"].items()})
+            if verbose:
+                print(f'  {label:14s} omega*dt p50={s["overall"]["p50"]:.3f}  '
+                      f'max={s["overall"]["max"]:.3f}  '
+                      f'over wall={100 * s["frac_over_wall"]:.3f}%')
+    return out

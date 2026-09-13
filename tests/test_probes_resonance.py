@@ -226,3 +226,17 @@ def test_tail_coherence_detects_aligned_vs_orthogonal_tails(setup):
     res = resonance.tail_coherence_report(ctx, 42, verbose=False)
     assert 1.0 <= res.metrics["tail_pr_p50"] <= ctx.model.V_theta.K + 1e-6
     assert 0.0 <= res.metrics["tail_mean_abs_cos_p50"] <= 1.0 + 1e-6
+
+
+def test_omega_dt_under_truncation_reports_both_arms(setup):
+    """The within-bundle control: truncation must move omega*dt, since it is
+    computed from the same B the truncation alters."""
+    ctx = setup(scale=2.0)
+    out = resonance.omega_dt_under_truncation(
+        ctx, 42, _FakeIntegratorModule, ranks=(1,), verbose=False)
+    assert set(out) == {"untruncated", "rank=1"}
+    full = out["untruncated"].metrics["omega_dt_max"]
+    trunc = out["rank=1"].metrics["omega_dt_max"]
+    # truncation removes curvature, so it can only lower lambda_max
+    assert trunc <= full + 1e-6
+    assert trunc < full          # and on a non-degenerate toy, strictly
