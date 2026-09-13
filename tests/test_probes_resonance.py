@@ -251,11 +251,18 @@ class _LayeredToy(nn.Module):
         self.emb = nn.Embedding(vocab, d)
         self.steps = nn.ModuleList(nn.Linear(d, d) for _ in range(n_layers))
         self.head = nn.Linear(d, vocab)
+        self.V_theta = _ToyVTheta(d=d)
         self.n_layers = n_layers
 
     def _fock_layer_step(self, h, h_prev, r, salience, m_b, gamma, dt,
                          layer_idx, *a, **kw):
-        return torch.tanh(self.steps[layer_idx](h)), h
+        # mirror the real layer step closely enough that observe()'s three
+        # hooks all fire: context_components -> harmonic_terms -> cfc_substep
+        comps = self.V_theta.context_components(h)
+        k, sl = self.V_theta.harmonic_terms(h, h, comps=comps)
+        h2, _ = _FakeIntegratorModule.cfc_substep(
+            h, h, sl, k, torch.tensor(1.0), 0.5)
+        return torch.tanh(self.steps[layer_idx](h2)), h
 
     def forward(self, x):
         h = self.emb(x)
@@ -300,3 +307,35 @@ def test_per_layer_profile_is_recorded_for_every_microbatch(tmp_path):
     assert info.per_layer_by_mb[0] != info.per_layer_by_mb[2]
     # the legacy field still holds microbatch 0, unchanged
     assert info.per_layer_h_grad == info.per_layer_by_mb[0]
+
+
+def test_monitor_separates_microbatches_and_layers(tmp_path):
+    """The flat per_layer view pools microbatches, so a spike confined to one
+    of them is invisible in it. by_mb_layer keeps them apart."""
+    torch.manual_seed(0)
+    model = _LayeredToy(n_layers=3)
+    rng = np.random.RandomState(0)
+    n_mb = 3
+    batches = [(r, r) for r in
+               (rng.randint(0, 16, (2, 5)).astype(np.int64) for _ in range(n_mb))]
+    bundle = {"step": 9, "grad_accum": n_mb, "batches": batches,
+              "model_state_dict": model.state_dict(),
+              "rng_state_cpu": torch.get_rng_state(), "rng_state_cuda": None,
+              "pre_clip_grad_norm": 1.0, "top_groups": {}}
+    ck = tmp_path / "mbl"; ck.mkdir()
+    torch.save(bundle, ck / "run_step9_spikebatch.pt")
+    ctx = ProbeContext(
+        model=model, device="cpu",
+        store=BundleStore(ckpt_dir=ck, ckpt_prefix="run", archive_root=tmp_path,
+                          verbose=False),
+        clip_cfg=GradClipConfig(default_clip=10.0), forward_fn=_forward_fn)
+
+    from semsimula_diag.probes import replayed, restored_model_state
+    with resonance.observe(model, _FakeIntegratorModule) as mon:
+        with restored_model_state(ctx, grads=False, weights=False, rng=False):
+            with replayed(ctx, bundle):
+                pass
+    keys = set(mon.by_mb_layer)
+    assert keys == {(mb, li) for mb in range(n_mb) for li in range(3)}, keys
+    # and the flat view really does pool them, which is why it was misleading
+    assert set(mon.per_layer) == {0, 1, 2}

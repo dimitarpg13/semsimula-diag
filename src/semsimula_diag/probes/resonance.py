@@ -99,8 +99,14 @@ class ResonanceMonitor:
     def __init__(self, wall: float = 2.0):
         self.wall = wall
         self.per_layer: Dict[int, List[torch.Tensor]] = {}
+        # (microbatch, layer) -> omega*dt. The flat `per_layer` view pools
+        # microbatches together, which is fine for a max but hides where a
+        # spike sits: at step 87196 the whole event lived in microbatch 2.
+        self.by_mb_layer: Dict[tuple, torch.Tensor] = {}
         self._pending: Optional[torch.Tensor] = None
         self._layer = 0
+        self._mb = 0
+        self._seen_layer0 = False
         self.dt_substep: Optional[float] = None
 
     def _stash(self, lam: torch.Tensor) -> None:
@@ -120,10 +126,21 @@ class ResonanceMonitor:
             m_b = m_b.unsqueeze(0)
         m_flat = m_b.squeeze(-1) if m_b.shape[-1] == 1 else m_b
         omega = (self._pending / m_flat.clamp(min=1e-30)).clamp(min=0).sqrt()
-        self.per_layer.setdefault(self._layer, []).append(
-            (omega * dt_kick).detach().flatten().cpu())
+        vals = (omega * dt_kick).detach().flatten().cpu()
+        self.per_layer.setdefault(self._layer, []).append(vals)
+        self.by_mb_layer[(self._mb, self._layer)] = vals
         self._pending = None
         self._layer += 1
+
+    def note_layer(self, layer_idx: int) -> None:
+        """Called from the `_fock_layer_step` hook, which is the only place
+        the true layer index is available -- neither `harmonic_terms` nor
+        `cfc_substep` receives it. A wrap back to layer 0 marks a new
+        microbatch."""
+        if layer_idx == 0 and self._seen_layer0:
+            self._mb += 1
+        self._seen_layer0 = True
+        self._layer = layer_idx
 
     def reset_layer_counter(self) -> None:
         self._layer = 0
@@ -145,6 +162,10 @@ class ResonanceMonitor:
             t = torch.cat(v)
             out["per_layer"][k] = {
                 **_pct(t), "frac_over_wall": float((t > self.wall).float().mean())}
+        out["by_mb_layer"] = {
+            k: {"max": float(v.max()), "p50": float(v.median()),
+                "frac_over_wall": float((v > self.wall).float().mean())}
+            for k, v in sorted(self.by_mb_layer.items())}
         return out
 
 
@@ -191,9 +212,21 @@ def observe(model, integrator_module, *, wall: float = 2.0,
             return original(h, v, f_harm, k_diag, m, dt)
         return _wrapped
 
+    def _wrap_layer(original):
+        def _wrapped(h, h_prev, r, salience, m_b, gamma, dt, layer_idx,
+                     *a, **kw):
+            mon.note_layer(layer_idx)
+            return original(h, h_prev, r, salience, m_b, gamma, dt,
+                            layer_idx, *a, **kw)
+        return _wrapped
+
+    layer_cm = (patched_attrs(model, {"_fock_layer_step": _wrap_layer})
+                if hasattr(model, "_fock_layer_step")
+                else contextlib.nullcontext())
     with patched_attrs(vt, {"harmonic_terms": _wrap_harmonic}):
         with patched_attrs(integrator_module, {"cfc_substep": _wrap_substep}):
-            yield mon
+            with layer_cm:
+                yield mon
 
 
 def omega_dt_report(
