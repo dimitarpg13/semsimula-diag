@@ -84,7 +84,7 @@ reinvent it.
 | `probes.tau_saturation.probe_hot_rows` | **NO — needs GPU** (ported later than the rest of this table; same engine, same gap) |
 | `probes.precision_cap.replay_rank_truncation_ablation` | **yes — GPU, step 87196**: the `rank=4` arm reproduces the untruncated reference exactly (2539.20, error 0.0000), and the untruncated arm matches the recorded 2539.2 |
 | `probes.precision_cap.replay_rank_perturbation_control` | **NO — needs GPU** (built 2026-09-13 as the control for the above; see the note below) |
-| `probes.resonance` | **NO — needs GPU** (built 2026-09-13; D2/D2b of the resonance-hypothesis note. Power iteration verified against `eigvalsh` on CPU) |
+| `probes.resonance` | **yes — GPU, steps 87196/86201/90360**: ran clean, max `omega*dt` 1.50-1.52 with 0.000% of tokens over the wall. Power iteration also verified against `eigvalsh` on CPU |
 
 ### Rank truncation must not pay the `baoab_cfc_lowrank` tax
 
@@ -298,6 +298,22 @@ The rank decision wants the same ablation on a healthy checkpoint, where
 `ntp` remains the column to read.
 
 ### `probes.resonance`: measuring the wall instead of inferring it
+
+**Outcome (A100, 2026-09-13): the resonance hypothesis is refuted, and the
+probe is GPU-verified.** Max `omega*dt` reads 1.500 / 1.524 / 1.522 at steps
+87196 / 86201 / 90360 against a wall at 2, with **0.000%** of tokens crossing
+anywhere; the value does not track spike magnitude (the largest spike has the
+*lowest* reading); truncation raises it rather than lowering it; and
+`tail_pr` comes back at 7.525/8, so the wells' weakest directions are nearly
+orthogonal rather than coherent. See §5 of the companion note.
+
+Two things worth carrying forward. The model runs at roughly 75% of the
+explicit kick's stability limit with real headroom — a standing fact nobody
+had measured. And truncating `B_k` *raises* well occupancy `g_k`, because the
+truncated directions were feeding the exponent that suppresses it, so a rank
+truncation changes two things at once and the occupancy term can dominate.
+That caveat applies to `replay_rank_truncation_ablation` too.
+
 
 D2 and D2b of
 `semsimula-paper/companion_notes/Resonance_Hypothesis_for_Gradient_Spikes_in_the_LowRank_Kick.md`.
