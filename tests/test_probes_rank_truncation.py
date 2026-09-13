@@ -223,3 +223,62 @@ def test_leaked_patch_from_an_interrupted_probe_is_refused(setup):
 def test_guard_passes_on_a_clean_model(setup):
     ctx, _bundle = setup
     assert_unpatched(ctx.model.V_theta, "context_components")
+
+
+# --- rank-preserving perturbation control -------------------------------
+
+def test_matched_noise_carries_exactly_the_truncated_energy():
+    """The control's whole claim is magnitude matching: the noise must carry
+    the squared Frobenius norm that truncating to `rank` discards."""
+    torch.manual_seed(0)
+    B = torch.randn(32, 10, 4, dtype=torch.double)
+    for rank in (1, 2, 3):
+        noise = precision_cap._matched_noise(B, rank, seed=7)
+        removed = B.pow(2).sum(dim=(-2, -1)) - _svd_truncate(B, rank).pow(
+            2).sum(dim=(-2, -1))
+        got = noise.pow(2).sum(dim=(-2, -1))
+        assert torch.allclose(got, removed, rtol=1e-8), rank
+
+
+def test_matched_noise_preserves_rank():
+    """Truncation drops rank; the control must not -- that is the one
+    property separating the two."""
+    torch.manual_seed(0)
+    B = torch.randn(16, 10, 4, dtype=torch.double)
+    perturbed = B + precision_cap._matched_noise(B, rank=1, seed=7)
+    assert (torch.linalg.svdvals(perturbed) > 1e-10).sum(-1).min().item() == 4
+    assert (torch.linalg.svdvals(_svd_truncate(B, 1)) > 1e-10).sum(-1).max().item() == 1
+
+
+def test_matched_noise_is_deterministic_across_calls():
+    """A checkpoint recompute re-runs the forward; if the noise differed
+    between the two, autograd would see inconsistent saved tensors."""
+    B = torch.randn(8, 10, 4)
+    a = precision_cap._matched_noise(B, 2, seed=7)
+    b = precision_cap._matched_noise(B, 2, seed=7)
+    assert torch.equal(a, b)
+    assert not torch.equal(a, precision_cap._matched_noise(B, 2, seed=8))
+
+
+def test_perturbation_control_runs_and_reports_energy(setup):
+    ctx, _bundle = setup
+    out = precision_cap.replay_rank_perturbation_control(
+        ctx, 42, ranks=(1, 2), verbose=False)
+    assert set(out) == {"full (unperturbed)",
+                        "noise matched to rank=1", "noise matched to rank=2"}
+    assert out["full (unperturbed)"].metrics["relative_force_error"] == 0.0
+    # more energy is displaced by a deeper truncation, so the match must grow
+    f1 = out["noise matched to rank=1"].metrics["perturbed_energy_frac"]
+    f2 = out["noise matched to rank=2"].metrics["perturbed_energy_frac"]
+    assert 0.0 < f2 < f1 <= 1.0
+
+
+def test_perturbation_control_refuses_a_leaked_patch(setup):
+    ctx, _bundle = setup
+    leaked = patched_attrs(ctx.model.V_theta,
+                           {"context_components": lambda orig: orig})
+    leaked.__enter__()
+    with pytest.raises(RuntimeError, match="did not finish cleanly"):
+        precision_cap.replay_rank_perturbation_control(ctx, 42, ranks=(1,),
+                                                       verbose=False)
+    leaked.__exit__(None, None, None)

@@ -26,7 +26,7 @@ from ._engine import (assert_unpatched, patched_attrs, replayed,
 from .context import ProbeContext
 
 __all__ = ["replay_precision_cap_ablation", "replay_curvature_rebalance_ablation",
-          "replay_rank_truncation_ablation"]
+           "replay_rank_truncation_ablation", "replay_rank_perturbation_control"]
 
 
 def _banks(model) -> List:
@@ -232,20 +232,69 @@ def _svd_truncate(B: torch.Tensor, rank: int) -> torch.Tensor:
     if rank >= B.shape[-1]:
         return B
     with torch.no_grad():
-        gram = B.transpose(-2, -1) @ B          # (..., r, r), stays on device
-        gram_cpu = gram.cpu()
-        if not torch.isfinite(gram_cpu).all():
-            raise RuntimeError(
-                "non-finite Gram matrix B^T B in rank truncation: the "
-                "replayed well parameters are already corrupt before any "
-                "truncation is applied, so the ablation would measure "
-                "noise. Check the untruncated arm's fidelity first.")
         # eigh gives ascending eigenvalues, so the top `rank` directions
         # are the trailing columns.
-        _, evecs = torch.linalg.eigh(gram_cpu)
-        v_top = evecs[..., -rank:].to(B.device)
+        _, evecs = _gram_eig(B)
+        v_top = evecs[..., -rank:]
         projector = v_top @ v_top.transpose(-2, -1)
     return B @ projector
+
+
+def _gram_eig(B: torch.Tensor):
+    """Eigendecomposition of ``B^T B``, returned on ``B``'s device.
+
+    Eigenvalues ascend and are exactly the squared singular values of
+    ``B``; eigenvectors are its right singular vectors. Shared by
+    :func:`_svd_truncate`, which needs the vectors, and
+    :func:`_matched_noise`, which needs the values. See
+    :func:`_svd_truncate` for why the decomposition itself runs on CPU.
+    """
+    gram = (B.transpose(-2, -1) @ B).cpu()      # (..., r, r); matmul on device
+    if not torch.isfinite(gram).all():
+        raise RuntimeError(
+            "non-finite Gram matrix B^T B: the replayed well parameters are "
+            "already corrupt before any truncation or perturbation is "
+            "applied, so the ablation would measure noise. Check the "
+            "untruncated arm's fidelity first.")
+    evals, evecs = torch.linalg.eigh(gram)
+    return evals.to(B.device), evecs.to(B.device)
+
+
+def _matched_noise(B: torch.Tensor, rank: int, seed: int) -> torch.Tensor:
+    """Random perturbation carrying exactly the curvature energy that
+    truncating ``B`` to ``rank`` would discard, but spread isotropically
+    so ``B``'s rank is left intact.
+
+    The truncation removes $\\sum_{i>r'} \\sigma_i^2$ of squared Frobenius
+    norm, and those $\\sigma_i^2$ are the discarded Gram eigenvalues, so
+    the matching magnitude comes free from the same decomposition. The
+    perturbation is scaled per well, since every well has its own
+    spectrum and a globally-matched norm would over-perturb the flat
+    wells and under-perturb the concentrated ones.
+
+    A Gaussian perturbation almost surely leaves ``B`` full rank, which is
+    the entire point: it separates "the discarded *directions* carried the
+    signal" from "a change of this *size*, anywhere, is enough".
+
+    **Determinism.** The noise is drawn from a local generator re-seeded
+    with a constant on every call, never from the global stream, so a
+    gradient-checkpoint recompute reproduces the forward pass exactly.
+    Seeding from a call counter instead would be precisely wrong: the
+    counter would advance between the forward and the recompute and the
+    two would disagree, which is the failure ``cfc_baoab.py`` documents
+    for ``torch.svd_lowrank``'s global-RNG projection.
+    """
+    with torch.no_grad():
+        evals, _ = _gram_eig(B)
+        n_drop = B.shape[-1] - rank
+        removed = evals[..., :n_drop].sum(-1).clamp(min=0.0)      # (...,)
+
+        gen = torch.Generator(device=B.device).manual_seed(seed)
+        noise = torch.randn(B.shape, generator=gen, device=B.device,
+                            dtype=B.dtype)
+        cur = noise.flatten(-2).norm(dim=-1).clamp(min=1e-12)     # (...,)
+        scale = (removed.sqrt() / cur)[..., None, None]
+    return noise * scale
 
 
 def replay_rank_truncation_ablation(
@@ -289,6 +338,22 @@ def replay_rank_truncation_ablation(
     truncation that leaves this near zero means the truncated directions
     were dead weight; a truncation that moves it substantially means they
     were carrying real signal.
+
+    **``relative_force_error`` saturates -- read ``ntp`` too.** The ratio
+    is ``||g_trunc - g_full|| / ||g_full||``, so once a truncated arm's
+    gradient collapses to a small fraction of the reference, the triangle
+    inequality pins the ratio to ``1 +/- ||g_trunc||/||g_full||`` no matter
+    which directions were removed. Observed on real hardware at step
+    87196: ranks 1, 2 and 3 reported 0.9998, 1.0002 and 0.9999 while their
+    gradient norms were 2.87, 4.35 and 2.83 against the reference's
+    2539.20 -- three indistinguishable numbers carrying no directional
+    information, because a ~900x norm collapse fixes the ratio on its own.
+    ``ntp`` stayed informative there and ordered correctly with rank
+    (4.3385 untruncated, then 4.3808, 4.4682, 4.6609), so treat ``ntp``
+    and ``pre_clip_grad_norm`` as the signal whenever the error ratio sits
+    near 1. A collapse under truncation also needs
+    :func:`replay_rank_perturbation_control` before it can be read as
+    evidence about rank at all.
 
     **Scope note.** "Force" here is the parameter gradient the training
     loss produces through the truncated well, not a separately-captured
@@ -355,4 +420,128 @@ def replay_rank_truncation_ablation(
             if verbose:
                 print(f'  rank={r:<16d} total={total:10.2f}  ntp={ntp:.4f}  '
                       f'relative_force_error={rel_err:.4f}')
+    return out
+
+
+def replay_rank_perturbation_control(
+    ctx: ProbeContext, step_tag: int,
+    ranks: Sequence[int] = (1, 2, 3),
+    seed: int = 20260913,
+    verbose: bool = True,
+) -> Dict[str, ProbeResult]:
+    """Control for :func:`replay_rank_truncation_ablation`: does the spike
+    care *which* directions were removed, or merely that ``B`` changed?
+
+    Run the truncation ablation first. If it shows the gradient collapsing
+    under truncation, that alone cannot say whether the discarded
+    directions were load-bearing, because truncation confounds two things:
+    it removes specific directions, *and* it changes ``B`` by a particular
+    magnitude. This probe holds the magnitude and drops the specificity --
+    each arm perturbs ``B`` by isotropic noise carrying exactly the energy
+    that truncating to ``rank`` would have discarded (see
+    :func:`_matched_noise`), while leaving ``B`` full rank.
+
+    Reading it against the truncation run, arm for arm:
+
+    * **Control collapses too** -- the well is on a knife edge and *any*
+      perturbation of this size defuses the spike. The truncation result
+      then says nothing about rank; it is a statement about the spike's
+      fragility, and the rank question needs a checkpoint that is not a
+      spike.
+    * **Control holds up while truncation collapsed** -- the discarded
+      directions were specifically load-bearing, and the truncation
+      result means what it appears to mean.
+
+    Args:
+        ranks: the truncation levels whose removed energy should be
+            matched. Pass the same values given to the truncation run so
+            the arms line up. ``rank >= r_full`` removes nothing and is
+            omitted rather than run as a no-op.
+        seed: fixed, and re-applied per call rather than advanced, so a
+            gradient-checkpoint recompute reproduces the forward exactly.
+
+    Returns a dict keyed ``"full (unperturbed)"`` plus one entry per rank,
+    each a :class:`ProbeResult` carrying ``metrics['pre_clip_grad_norm']``,
+    ``metrics['ntp']``, ``metrics['relative_force_error']`` and
+    ``metrics['perturbed_energy_frac']`` -- the mean fraction of ``B``'s
+    squared Frobenius norm that the noise actually carried, which is the
+    audit that the magnitude matching did what it claims.
+
+    **Read ``ntp`` and ``pre_clip_grad_norm``, not just
+    ``relative_force_error``.** That ratio saturates at 1.0 whenever the
+    perturbed gradient collapses to a small fraction of the reference, at
+    which point it is fixed by the norm collapse alone and carries no
+    directional information (see the same note on the truncation probe).
+    """
+    ctx.require("store", "clip_cfg", "forward_fn")
+    assert_unpatched(ctx.model.V_theta, "context_components")
+    bundle, path = ctx.store.load(step_tag)
+    if verbose:
+        print(f'[rankperturb] loaded {path.name}  step={bundle["step"]}  '
+              f'pre_clip_grad_norm={bundle.get("pre_clip_grad_norm")}')
+
+    def _flat_grad(model) -> torch.Tensor:
+        return torch.cat([p.grad.detach().flatten()
+                          for p in model.parameters() if p.grad is not None])
+
+    def _measure(rank: Optional[int]):
+        energy: List[torch.Tensor] = []
+        if rank is None:
+            cm: contextlib.AbstractContextManager = contextlib.nullcontext()
+        else:
+            def _make_wrapper(original):
+                def _wrapped(xis):
+                    out_c = []
+                    for (mu, a, w, B) in original(xis):
+                        if B.shape[-1]:
+                            noise = _matched_noise(B, rank, seed)
+                            with torch.no_grad():
+                                energy.append(
+                                    (noise.pow(2).sum() / B.pow(2).sum().clamp(
+                                        min=1e-12)).detach())
+                            B = B + noise
+                        out_c.append((mu, a, w, B))
+                    return out_c
+                return _wrapped
+            cm = patched_attrs(ctx.model.V_theta,
+                               {"context_components": _make_wrapper})
+        with cm:
+            with replayed(ctx, bundle) as info:
+                pg = per_group_grad_norms(ctx.model, ctx.clip_cfg)
+                excl = ctx.clip_cfg.watchdog_exclude_groups
+                total = sum(v * v for k, v in pg.items() if k not in excl) ** 0.5
+                grad_vec = _flat_grad(ctx.model)
+                ntp = info.ntp
+        frac = float(torch.stack(energy).mean()) if energy else 0.0
+        return total, ntp, grad_vec, pg, frac
+
+    out: Dict[str, ProbeResult] = {}
+    with restored_model_state(ctx, grads=False, weights=False, rng=False):
+        full_total, full_ntp, full_grad, full_pg, _ = _measure(None)
+        full_norm = float(full_grad.norm()) or 1e-12
+        out["full (unperturbed)"] = ProbeResult(
+            probe_name="rank_perturbation_control",
+            step_tag=bundle.get("step", step_tag),
+            metrics={"rank": float("inf"), "pre_clip_grad_norm": full_total,
+                     "ntp": full_ntp, "relative_force_error": 0.0,
+                     "perturbed_energy_frac": 0.0},
+            per_group=full_pg)
+        if verbose:
+            print(f'  {"full (unperturbed)":22s} total={full_total:10.2f}  '
+                  f'ntp={full_ntp:.4f}')
+
+        for r in ranks:
+            total, ntp, grad_vec, pg, frac = _measure(r)
+            rel_err = float((grad_vec - full_grad).norm() / full_norm)
+            out[f"noise matched to rank={r}"] = ProbeResult(
+                probe_name="rank_perturbation_control",
+                step_tag=bundle.get("step", step_tag),
+                metrics={"rank": r, "pre_clip_grad_norm": total, "ntp": ntp,
+                         "relative_force_error": rel_err,
+                         "perturbed_energy_frac": frac},
+                per_group=pg)
+            if verbose:
+                print(f'  noise~rank={r:<11d} total={total:10.2f}  '
+                      f'ntp={ntp:.4f}  relative_force_error={rel_err:.4f}  '
+                      f'energy_frac={frac:.4f}')
     return out

@@ -82,7 +82,8 @@ reinvent it.
 | `probes.clip_order` | **NO — needs GPU** |
 | `probes.integrator` | **NO — needs GPU** |
 | `probes.tau_saturation.probe_hot_rows` | **NO — needs GPU** (ported later than the rest of this table; same engine, same gap) |
-| `probes.precision_cap.replay_rank_truncation_ablation` | **NO — needs GPU** (built 2026-09-13, was proposed-only in the companion note until now; same gap). First GPU attempt aborted after 4 h at 3/5 arms — see the note below |
+| `probes.precision_cap.replay_rank_truncation_ablation` | **yes — GPU, step 87196**: the `rank=4` arm reproduces the untruncated reference exactly (2539.20, error 0.0000), and the untruncated arm matches the recorded 2539.2 |
+| `probes.precision_cap.replay_rank_perturbation_control` | **NO — needs GPU** (built 2026-09-13 as the control for the above; see the note below) |
 
 ### Rank truncation must not pay the `baoab_cfc_lowrank` tax
 
@@ -246,6 +247,54 @@ runtime.** Do not re-run the cell, and do not `importlib.reload` --
 reloading updates the code but leaves exactly the graph and buffer state
 that caused the failure. Reload is only safe in a kernel whose last
 replay completed.
+
+### Step 87196 result, and why it is not yet a rank result
+
+First clean five-arm run (A100, 3 min):
+
+| arm | pre-clip grad norm | ntp | batch PPL | relative_force_error |
+|---|---|---|---|---|
+| untruncated | 2539.20 | 4.3385 | 76.6 | — |
+| rank=4 | 2539.20 | 4.3385 | 76.6 | 0.0000 |
+| rank=3 | 2.83 | 4.3808 | 79.9 | 0.9999 |
+| rank=2 | 4.35 | 4.4682 | 87.2 | 1.0002 |
+| rank=1 | 2.87 | 4.6609 | 105.7 | 0.9998 |
+
+`rank=4` is the built-in fidelity check (`_svd_truncate` short-circuits at
+`rank >= r_full`) and it passes exactly, so the harness is sound.
+
+**`relative_force_error` is uninformative here and the probe's docstring
+now says so.** With `||g_full|| = 2539` and `||g_trunc|| ~ 3`, the
+triangle inequality pins the ratio to `[0.9989, 1.0011]`; all three
+observed values sit inside that band. Once a gradient collapses, the
+metric is fixed by the norm ratio alone and carries no directional
+information. `ntp` stays informative and orders correctly with rank.
+
+The `ntp` column is the real Stage 2 signal: dropping even the *smallest*
+of four directions costs 4.3% batch perplexity, and the cost grows
+roughly geometrically (13.8% at rank 2, 38.0% at rank 1). On this
+evidence the well is not wasting its rank budget, consistent with Stage
+1's saturated `pr_p50 = 3.68/4`.
+
+The striking part is that any truncation drops the gradient norm from
+2539 to ~3 -- a normal, healthy value -- for a loss cost of 4.3%. That
+looks like knife-edge sensitivity rather than a magnitude effect, which
+would reconcile with §33's finding that `sigma_max(B_k)^2` is only
++1-24% elevated at spike checkpoints: a resonance can be tripped by a
+small change in the operator even when its norm barely moves.
+
+**But the ablation cannot yet distinguish** "the discarded directions
+carried the spike" from "any perturbation of this size defuses it" --
+and the non-monotonic totals across ranks 1/2/3 (2.87, 4.35, 2.83, all
+noise around ~3) hint at the latter.
+`replay_rank_perturbation_control` is the decisive control: same energy,
+same harness, rank left intact. Run it at step 87196 with the same
+`ranks` before reading the truncation numbers as a statement about rank.
+
+Separately, step 87196 is an outlier by construction and therefore the
+worst checkpoint on which to ask whether the model uses its rank budget.
+The rank decision wants the same ablation on a healthy checkpoint, where
+`ntp` remains the column to read.
 
 ### On the §11.5 golden-output fixtures
 
