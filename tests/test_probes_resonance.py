@@ -1,0 +1,228 @@
+"""D2 / D2b: omega*dt via power iteration, and cross-well tail coherence."""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+import torch.nn as nn
+
+from semsimula_diag import BundleStore, GradClipConfig, ProbeContext
+from semsimula_diag.probes import resonance
+from semsimula_diag.probes.resonance import _lambda_max
+
+
+# --- the numerical core -------------------------------------------------
+
+def test_power_iteration_matches_exact_eigendecomposition():
+    """The whole affordability argument is that lambda_max needs no
+    eigensolver. It must still agree with one."""
+    torch.manual_seed(0)
+    G = torch.randn(6, 40, 12, dtype=torch.double)
+    got = _lambda_max(G, n_iter=60, seed=1)
+    want = torch.linalg.eigvalsh(G @ G.transpose(-2, -1))[..., -1]
+    assert torch.allclose(got, want, rtol=1e-6), (got, want)
+
+
+def test_power_iteration_is_batched_over_leading_dims():
+    torch.manual_seed(0)
+    G = torch.randn(3, 5, 20, 7, dtype=torch.double)
+    got = _lambda_max(G, n_iter=60, seed=1)
+    want = torch.linalg.eigvalsh(G @ G.transpose(-2, -1))[..., -1]
+    assert got.shape == (3, 5)
+    # Convergence is slow where the top two eigenvalues nearly coincide, and
+    # the Rayleigh quotient of an unconverged vector is always an
+    # UNDER-estimate -- so assert the bound as well as the tolerance.
+    assert (got <= want + 1e-9).all()
+    assert torch.allclose(got, want, rtol=5e-3)
+
+
+def test_power_iteration_is_deterministic():
+    G = torch.randn(4, 10, 5)
+    assert torch.equal(_lambda_max(G, 8, seed=3), _lambda_max(G, 8, seed=3))
+
+
+def test_power_iteration_handles_a_rank_deficient_factor():
+    """A token where every well is numerically zero-weight gives G = 0;
+    lambda_max must be 0, not NaN."""
+    G = torch.zeros(3, 9, 4)
+    out = _lambda_max(G, 8, seed=1)
+    assert torch.isfinite(out).all() and float(out.abs().max()) == 0.0
+
+
+# --- the monitor against a toy integrator -------------------------------
+
+class _ToyVTheta(nn.Module):
+    """Exposes the two methods the monitor hooks, with a controllable
+    low-rank factor so omega*dt is known in advance."""
+
+    def __init__(self, d=6, K=2, r=3, scale=1.0):
+        super().__init__()
+        self.d, self.K, self.r, self.scale = d, K, r, scale
+        self.proj = nn.Linear(d, K * d * r, bias=False)
+
+    def _B(self, xis):
+        B = self.proj(xis).reshape(*xis.shape[:-1], self.K, self.d, self.r)
+        return self.scale * B
+
+    def context_components(self, xis):
+        B = self._B(xis)
+        z = torch.zeros(*B.shape[:-1])
+        return [(z, z + 1.0, z[..., :1].squeeze(-1) + 1.0, B)]
+
+    def harmonic_terms(self, xis, h, *, comps=None):
+        k = torch.ones_like(h)
+        return k, h * k
+
+    def harmonic_terms_lowrank(self, xis, h, *, comps=None):
+        B = self._B(xis) if comps is None else comps[0][3]
+        G = B.reshape(*B.shape[:-3], self.d, self.K * self.r)
+        return torch.ones_like(h), h, G, G.new_zeros(G.shape[:-2] + (G.shape[-1],))
+
+
+class _FakeIntegratorModule:
+    """Stands in for the module the model imports cfc_substep from."""
+    @staticmethod
+    def cfc_substep(h, v, f_harm, k_diag, m, dt):
+        return h, v
+
+
+class _ToyModel(nn.Module):
+    def __init__(self, scale=1.0, n_layers=2, mass=1.0, dt_substep=0.5):
+        super().__init__()
+        self.emb = nn.Embedding(16, 6)
+        self.V_theta = _ToyVTheta(scale=scale)
+        self.head = nn.Linear(6, 16)
+        self.n_layers, self.mass, self.dt_substep = n_layers, mass, dt_substep
+
+    def forward(self, x):
+        h = self.emb(x)
+        for _ in range(self.n_layers):
+            xis = h
+            comps = self.V_theta.context_components(xis)
+            k, s = self.V_theta.harmonic_terms(xis, h, comps=comps)
+            h, _ = _FakeIntegratorModule.cfc_substep(
+                h, h, s, k, torch.tensor(self.mass), self.dt_substep)
+        return self.head(h)
+
+
+def _forward_fn(model, x, y, ctx):
+    logits = model(x)
+    loss = nn.functional.cross_entropy(
+        logits.reshape(-1, 16), y.reshape(-1))
+    z = torch.tensor(0.0)
+    return loss, loss, z, z
+
+
+@pytest.fixture
+def setup(tmp_path):
+    def build(scale=1.0, mass=1.0, dt_substep=0.5):
+        torch.manual_seed(0)
+        model = _ToyModel(scale=scale, mass=mass, dt_substep=dt_substep)
+        # fixed batch: these tests compare omega*dt ACROSS builds, so the
+        # data must not move when only the parameter under test does
+        rows = np.random.RandomState(0).randint(
+            0, 16, size=(2, 5)).astype(np.int64)
+        bundle = {"step": 42, "grad_accum": 1, "batches": [(rows, rows)],
+                  "model_state_dict": model.state_dict(),
+                  "rng_state_cpu": torch.get_rng_state(), "rng_state_cuda": None,
+                  "pre_clip_grad_norm": 1.0, "top_groups": {}}
+        ck = tmp_path / f"c{scale}{mass}{dt_substep}"
+        ck.mkdir(exist_ok=True)
+        torch.save(bundle, ck / "run_step42_spikebatch.pt")
+        ctx = ProbeContext(
+            model=model, device="cpu",
+            store=BundleStore(ckpt_dir=ck, ckpt_prefix="run",
+                              archive_root=tmp_path, verbose=False),
+            clip_cfg=GradClipConfig(default_clip=10.0), forward_fn=_forward_fn)
+        return ctx
+    return build
+
+
+def test_monitor_records_every_layer(setup):
+    ctx = setup()
+    res = resonance.omega_dt_report(ctx, 42, _FakeIntegratorModule,
+                                    verbose=False)
+    assert set(res.per_layer) == {0, 1}
+    assert res.metrics["omega_dt_max"] > 0
+
+
+def test_omega_dt_scales_with_the_low_rank_factor(setup):
+    """omega ~ sqrt(lambda_max) ~ ||B||, so doubling B doubles omega*dt."""
+    a = resonance.omega_dt_report(setup(scale=1.0), 42, _FakeIntegratorModule,
+                                  verbose=False).metrics["omega_dt_max"]
+    b = resonance.omega_dt_report(setup(scale=2.0), 42, _FakeIntegratorModule,
+                                  verbose=False).metrics["omega_dt_max"]
+    assert b == pytest.approx(2 * a, rel=1e-3)
+
+
+def test_omega_dt_uses_the_full_kick_step_not_the_half_substep(setup):
+    """In baoab_cfc the low-rank part rides the kick (dt), while
+    cfc_substep is handed dt/2. Reporting the substep value would
+    understate the wall by exactly 2x."""
+    got = resonance.omega_dt_report(setup(dt_substep=0.5), 42,
+                                    _FakeIntegratorModule,
+                                    verbose=False).metrics["omega_dt_max"]
+    ctx = setup(dt_substep=0.5)
+    with torch.no_grad():
+        model = ctx.model
+        xis = model.emb(torch.as_tensor(
+            np.random.RandomState(0).randint(0, 16, (2, 5))).long())
+    # value is built from dt_kick = 2 * dt_substep
+    half = resonance.omega_dt_report(setup(dt_substep=0.25), 42,
+                                     _FakeIntegratorModule,
+                                     verbose=False).metrics["omega_dt_max"]
+    assert got == pytest.approx(2 * half, rel=1e-6)
+
+
+def test_omega_dt_divides_by_mass(setup):
+    """omega = sqrt(lambda_max / m): quadrupling the mass halves omega*dt."""
+    a = resonance.omega_dt_report(setup(mass=1.0), 42, _FakeIntegratorModule,
+                                  verbose=False).metrics["omega_dt_max"]
+    b = resonance.omega_dt_report(setup(mass=4.0), 42, _FakeIntegratorModule,
+                                  verbose=False).metrics["omega_dt_max"]
+    assert b == pytest.approx(a / 2, rel=1e-3)
+
+
+def test_frac_over_wall_responds_to_the_wall(setup):
+    ctx = setup(scale=3.0)
+    hi = resonance.omega_dt_report(ctx, 42, _FakeIntegratorModule, wall=1e9,
+                                   verbose=False).metrics["frac_over_wall"]
+    lo = resonance.omega_dt_report(setup(scale=3.0), 42, _FakeIntegratorModule,
+                                   wall=0.0, verbose=False
+                                   ).metrics["frac_over_wall"]
+    assert hi == 0.0 and lo == 1.0
+
+
+def test_observe_restores_both_hooks(setup):
+    ctx = setup()
+    before_h = ctx.model.V_theta.harmonic_terms.__func__
+    before_s = _FakeIntegratorModule.cfc_substep
+    with resonance.observe(ctx.model, _FakeIntegratorModule):
+        pass
+    assert ctx.model.V_theta.harmonic_terms.__func__ is before_h
+    assert _FakeIntegratorModule.cfc_substep is before_s
+
+
+def test_report_refuses_a_vtheta_without_the_lowrank_split(setup):
+    class _NoSplit(_ToyVTheta):
+        harmonic_terms_lowrank = None
+        def __getattribute__(self, name):
+            if name == "harmonic_terms_lowrank":
+                raise AttributeError(name)
+            return super().__getattribute__(name)
+
+    ctx = setup()
+    ctx.model.V_theta = _NoSplit()
+    with pytest.raises(RuntimeError, match="harmonic_terms_lowrank"):
+        resonance.omega_dt_report(ctx, 42, _FakeIntegratorModule, verbose=False)
+
+
+# --- D2b ----------------------------------------------------------------
+
+def test_tail_coherence_detects_aligned_vs_orthogonal_tails(setup):
+    """The signature the note predicts: tail_pr near 1 when every well's
+    weakest direction points the same way, near n_wells when they do not."""
+    ctx = setup()
+    res = resonance.tail_coherence_report(ctx, 42, verbose=False)
+    assert 1.0 <= res.metrics["tail_pr_p50"] <= ctx.model.V_theta.K + 1e-6
+    assert 0.0 <= res.metrics["tail_mean_abs_cos_p50"] <= 1.0 + 1e-6

@@ -84,6 +84,7 @@ reinvent it.
 | `probes.tau_saturation.probe_hot_rows` | **NO — needs GPU** (ported later than the rest of this table; same engine, same gap) |
 | `probes.precision_cap.replay_rank_truncation_ablation` | **yes — GPU, step 87196**: the `rank=4` arm reproduces the untruncated reference exactly (2539.20, error 0.0000), and the untruncated arm matches the recorded 2539.2 |
 | `probes.precision_cap.replay_rank_perturbation_control` | **NO — needs GPU** (built 2026-09-13 as the control for the above; see the note below) |
+| `probes.resonance` | **NO — needs GPU** (built 2026-09-13; D2/D2b of the resonance-hypothesis note. Power iteration verified against `eigvalsh` on CPU) |
 
 ### Rank truncation must not pay the `baoab_cfc_lowrank` tax
 
@@ -295,6 +296,47 @@ Separately, step 87196 is an outlier by construction and therefore the
 worst checkpoint on which to ask whether the model uses its rank budget.
 The rank decision wants the same ablation on a healthy checkpoint, where
 `ntp` remains the column to read.
+
+### `probes.resonance`: measuring the wall instead of inferring it
+
+D2 and D2b of
+`semsimula-paper/companion_notes/Resonance_Hypothesis_for_Gradient_Spikes_in_the_LowRank_Kick.md`.
+
+Unlike every other probe here this one is not a replay ablation: `omega*dt`
+exists during the forward pass, before a gradient does, so it is a *leading*
+indicator where the live watchdog is post-hoc on gradient norm.
+
+Three things make it affordable where `baoab_cfc_lowrank` is not:
+
+1. Only `lambda_max(L)` is wanted, not the spectrum, so power iteration on
+   `L v = G (G^T v)` suffices — no eigensolver, no cuSOLVER, thin matmuls
+   only. Verified against `torch.linalg.eigvalsh` on CPU.
+2. `G` is reconstructed by calling `harmonic_terms_lowrank` on exactly the
+   `(xis, h)` the layer already linearised at, hooked via `harmonic_terms`
+   (which the `baoab_cfc` path does call). The model's own computation is
+   untouched.
+3. `cfc_substep` is hooked alongside purely to read the mass and step in
+   actual use rather than assuming them.
+
+**One convention worth stating, because getting it wrong is a silent factor
+of 2.** `cfc_substep` receives `half = 0.5 * dt`, but under `baoab_cfc` the
+low-rank part rides the *kick*, which runs for the full `dt` — and the kick
+is what carries the stability wall. The monitor therefore reports against
+`2 * dt_substep`. There is a test pinning this.
+
+**The estimate is one-sided.** A Rayleigh quotient of a not-fully-converged
+vector always *under*-estimates `lambda_max`, and convergence is slowest when
+the top two eigenvalues nearly coincide. So a reading near the wall means "at
+least this large"; raise `n_power_iter` before calling a checkpoint clear.
+
+`tail_coherence_report` (D2b) measures what no per-well statistic can: the
+participation ratio is computed within a well and is blind to whether
+different wells' weakest directions align, yet it is that aligned sum which
+sets `lambda_max(L)`. Each well's weakest `h`-space direction is obtained
+without a `d x r` SVD as `B v_min / s_min` from the `r x r` Gram matrix; the
+reported `tail_pr` is the participation ratio of the stacked tails, computed
+from the small `M M^T` since it shares all nonzero eigenvalues with `M^T M`.
+It runs from 1 (every tail identical) to n_wells (mutually orthogonal).
 
 ### On the §11.5 golden-output fixtures
 

@@ -12,7 +12,8 @@ MIGRATION.md and the tour notebook's verification section.
 from __future__ import annotations
 
 from . import (clip_order, integrator, layer_profile, precision_cap,
-               row_attribution, stiffness, tau_saturation, tokens)
+               resonance, row_attribution, stiffness, tau_saturation,
+               tokens)
 from ._engine import ReplayInfo, replayed, restored_model_state
 from .context import MissingContextError, ProbeContext
 
@@ -20,5 +21,6 @@ __all__ = [
     "ProbeContext", "MissingContextError",
     "replayed", "restored_model_state", "ReplayInfo",
     "clip_order", "integrator", "layer_profile", "precision_cap",
-    "row_attribution", "stiffness", "tau_saturation", "tokens",
+    "row_attribution", "stiffness", "resonance",
+    "tau_saturation", "tokens",
 ]
