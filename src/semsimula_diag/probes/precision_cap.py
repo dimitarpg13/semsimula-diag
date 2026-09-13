@@ -21,7 +21,8 @@ import torch
 
 from ..clipping import per_group_grad_norms
 from ..report import ProbeResult
-from ._engine import patched_attrs, replayed, restored_model_state
+from ._engine import (assert_unpatched, patched_attrs, replayed,
+                      restored_model_state)
 from .context import ProbeContext
 
 __all__ = ["replay_precision_cap_ablation", "replay_curvature_rebalance_ablation",
@@ -270,6 +271,9 @@ def replay_rank_truncation_ablation(
     change what the optimizer would have done.
     """
     ctx.require("store", "clip_cfg", "forward_fn")
+    # A leaked patch would make the untruncated reference arm run truncated,
+    # silently rescaling every relative_force_error below.
+    assert_unpatched(ctx.model.V_theta, "context_components")
     bundle, path = ctx.store.load(step_tag)
     if verbose:
         print(f'[ranktrunc] loaded {path.name}  step={bundle["step"]}  '

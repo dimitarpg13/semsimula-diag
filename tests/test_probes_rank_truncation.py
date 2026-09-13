@@ -17,6 +17,7 @@ import torch.nn as nn
 
 from semsimula_diag import BundleStore, GradClipConfig, ProbeContext
 from semsimula_diag.probes import precision_cap
+from semsimula_diag.probes._engine import assert_unpatched, patched_attrs
 from semsimula_diag.probes.precision_cap import _svd_truncate
 
 
@@ -192,3 +193,33 @@ def test_returns_one_result_per_requested_rank_plus_reference(setup):
     out = precision_cap.replay_rank_truncation_ablation(
         ctx, 42, ranks=(1, 2, 3), verbose=False)
     assert set(out) == {"full (untruncated)", "rank=1", "rank=2", "rank=3"}
+
+
+def test_leaked_patch_from_an_interrupted_probe_is_refused(setup):
+    """A KeyboardInterrupt can orphan patched_attrs' generator mid-yield, so
+    its `finally` restore fires at an arbitrary later GC instead of at the
+    `with` block's exit. The leaked wrapper keeps firing in the meantime --
+    which would make the UNTRUNCATED reference arm run truncated, silently
+    rescaling every relative_force_error measured against it. Observed for
+    real on an A100 as a CheckpointError when the GC happened to land
+    between a checkpointed forward and its backward recompute.
+    """
+    ctx, _bundle = setup
+    leaked = patched_attrs(ctx.model.V_theta,
+                           {"context_components": lambda orig: orig})
+    leaked.__enter__()          # deliberately never exited, as an interrupt leaves it
+
+    with pytest.raises(RuntimeError, match="did not finish cleanly"):
+        precision_cap.replay_rank_truncation_ablation(ctx, 42, ranks=(1,),
+                                                      verbose=False)
+
+    leaked.__exit__(None, None, None)
+    # and once restored, the probe runs again
+    out = precision_cap.replay_rank_truncation_ablation(ctx, 42, ranks=(1,),
+                                                        verbose=False)
+    assert "rank=1" in out
+
+
+def test_guard_passes_on_a_clean_model(setup):
+    ctx, _bundle = setup
+    assert_unpatched(ctx.model.V_theta, "context_components")

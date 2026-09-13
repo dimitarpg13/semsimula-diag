@@ -24,7 +24,7 @@ from ..clipping import ClipThenSum, per_group_grad_norms
 from .context import ProbeContext
 
 __all__ = ["ReplayInfo", "replayed", "restored_model_state",
-           "patched_attrs", "iter_isolated_rows"]
+           "patched_attrs", "assert_unpatched", "iter_isolated_rows"]
 
 
 @dataclass
@@ -92,6 +92,9 @@ def restored_model_state(ctx: ProbeContext, *, grads: bool = True,
         model.train(was_training)
 
 
+_ACTIVE_PATCHES = "_semsimula_diag_active_patches"
+
+
 @contextlib.contextmanager
 def patched_attrs(obj: Any,
                   patches: Dict[str, Callable[[Callable], Callable]]
@@ -111,15 +114,63 @@ def patched_attrs(obj: Any,
     Every named attribute must already exist on ``obj``; a typo or a wrong
     module produces an ``AttributeError`` from ``getattr`` immediately,
     rather than a hook that silently never fires.
+
+    Which names are currently patched is recorded on ``obj`` itself, so
+    :func:`assert_unpatched` can spot a patch that outlived its ``with``
+    block. The record lives on the object rather than on the wrapper
+    because a ``make_wrapper`` is free to return a bound method or any
+    other callable that rejects attribute assignment.
     """
     originals = {name: getattr(obj, name) for name in patches}
+    active = getattr(obj, _ACTIVE_PATCHES, None)
+    if active is None:
+        active = set()
+        setattr(obj, _ACTIVE_PATCHES, active)
     try:
         for name, make_wrapper in patches.items():
             setattr(obj, name, make_wrapper(originals[name]))
+            active.add(name)
         yield
     finally:
         for name, original in originals.items():
             setattr(obj, name, original)
+            active.discard(name)
+
+
+def assert_unpatched(obj: Any, *names: str) -> None:
+    """Raise if any of ``names`` on ``obj`` is still a :func:`patched_attrs`
+    wrapper left behind by an earlier, unfinished probe.
+
+    ``patched_attrs`` is a generator-based context manager, so a
+    ``KeyboardInterrupt`` -- a user stopping a long replay in a notebook --
+    can orphan it mid-``yield`` without running its ``finally``. The
+    restore then fires whenever CPython garbage-collects the abandoned
+    generator: an arbitrary later moment, possibly in the middle of an
+    unrelated forward/backward.
+
+    Both outcomes are bad and only one of them is loud. If the collection
+    lands between a gradient-checkpointed forward and its backward
+    recompute, the two disagree about which tensors were saved and
+    ``torch.utils.checkpoint`` raises ``CheckpointError``. If it lands
+    anywhere else, the leaked wrapper just keeps firing -- an ablation's
+    *untruncated reference* arm silently runs truncated, and since every
+    ``relative_force_error`` is measured against that reference, the whole
+    sweep is quietly wrong while looking entirely plausible.
+
+    Call this at the top of any probe that patches, so a poisoned kernel is
+    reported as one instead of returning numbers.
+    """
+    active = getattr(obj, _ACTIVE_PATCHES, None) or set()
+    stale = [n for n in names if n in active]
+    if stale:
+        raise RuntimeError(
+            f"{type(obj).__name__}.{', '.join(stale)} still carries a "
+            "semsimula_diag patch from an earlier probe that did not finish "
+            "cleanly -- most likely an interrupted replay. Results from this "
+            "state cannot be trusted: an untruncated reference arm would run "
+            "truncated. Restart the kernel and re-run from the setup cells. "
+            "Note that `git pull` alone will NOT pick up new code, since the "
+            "module is already imported.")
 
 
 def iter_isolated_rows(

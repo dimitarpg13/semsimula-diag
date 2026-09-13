@@ -127,6 +127,43 @@ vectors/values *without raising*". The aborted run's `rank=1` and
 the gradient norm collapsed 2539 -> ~2.9; those numbers were discarded
 rather than trusted, and the ablation should be re-run from scratch.
 
+### Interrupting a replay poisons the kernel (`assert_unpatched`)
+
+The follow-up attempt surfaced a second, independent hazard. After the
+4-hour run was interrupted, a `git pull` + re-run produced a
+`CheckpointError` on the *untruncated reference* arm — the one arm that
+uses `nullcontext()` and never calls `_svd_truncate` at all. The saved
+metadata was `[8,512,8,4]`, `[8,512,8,384,4]`, `[8,512,8,4,4]` (exactly
+`S`, `U`, `Vh` for `B` of shape `(8,512,K=8,d=384,r=4)`) against
+recomputed `[8,512,8,384]` throughout: the forward had run an SVD and the
+backward recompute had not.
+
+Two causes, both worth knowing:
+
+1. **`git pull` does not reload an imported module.** The kernel kept
+   serving the cached `sys.modules` entry, so the re-run still executed
+   the old GPU-SVD code. Only a kernel restart (or an explicit
+   `importlib.reload`) picks up pulled source.
+2. **`KeyboardInterrupt` can orphan `patched_attrs`.** It is a
+   generator-based context manager; interrupting mid-`yield` leaves the
+   generator suspended rather than closed, so its `finally` restore runs
+   whenever CPython later garbage-collects it. Here that landed between
+   a gradient-checkpointed forward and its backward recompute, which is
+   why the two disagreed.
+
+The `CheckpointError` was the lucky outcome. Had the collection landed a
+moment later, the run would have *succeeded* with a silently rank-3
+truncated "untruncated" reference — rescaling every `relative_force_error`
+measured against it, with nothing to indicate anything was wrong.
+
+`patched_attrs` now records active patch names on the patched object, and
+`assert_unpatched(obj, *names)` turns a leaked patch into an immediate
+`RuntimeError` naming the restart requirement.
+`replay_rank_truncation_ablation` calls it before doing anything else.
+The record lives on the object, not on the wrapper, because a
+`make_wrapper` may legitimately return a bound method or other callable
+that rejects attribute assignment.
+
 The replay probes have unit tests covering the engine (weight/grad/RNG
 restoration, restoration on the exception path, clip-then-sum actually
 firing) against a toy model — but **a passing CPU test says nothing about
