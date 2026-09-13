@@ -389,9 +389,17 @@ def sigma_lr_spectrum_by_site(ctx: ProbeContext, x: torch.Tensor,
             for ch, (_mu, _a, _w_, B) in enumerate(comps):
                 if B.shape[-1] == 0:
                     continue
-                sv = torch.linalg.svdvals(B.detach())
-                sv = sv.float().reshape(-1, sv.shape[-1]).cpu().double()
-                s2 = sv ** 2
+                # PR needs only sigma_i^2, which are the eigenvalues of
+                # the r x r Gram matrix -- NOT a d x r SVD. At the deployed
+                # shape B is (n_b, T, K, 384, 4) per site, so svdvals here
+                # means ~1.3M batched 384x4 decompositions per forward,
+                # which is the same cuSOLVER cost that made the rank
+                # truncation ablation unusable. The eigh runs on CPU
+                # because cuSOLVER rejects batched 4x4 eigh on CUDA 13.0.
+                Bd = B.detach()
+                gram = (Bd.transpose(-2, -1) @ Bd).cpu().double()
+                s2 = torch.linalg.eigvalsh(gram).clamp(min=0.0)
+                s2 = s2.reshape(-1, s2.shape[-1])
                 pr = (s2.sum(-1) ** 2) / (s2 ** 2).sum(-1).clamp(min=1e-300)
                 sites.setdefault((cur["layer"], ch), []).append(pr)
             return comps

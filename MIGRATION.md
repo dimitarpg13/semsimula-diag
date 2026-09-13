@@ -297,6 +297,21 @@ worst checkpoint on which to ask whether the model uses its rank budget.
 The rank decision wants the same ablation on a healthy checkpoint, where
 `ntp` remains the column to read.
 
+### `sigma_lr_spectrum_by_site` shipped with the same cuSOLVER trap
+
+Reused `torch.linalg.svdvals(B)` from `sigma_lr_spectrum_report` without
+re-applying the lesson from `_svd_truncate` above: at the deployed shape `B`
+is `(n_b, T, K, 384, 4)` per site, so a full SVD there is ~1.3M batched
+384x4 decompositions per forward across 40 sites -- the identical cost
+profile that made `baoab_cfc_lowrank` and the first `replay_rank_truncation_ablation`
+unaffordable. Caught live: 7+ minutes with no output on an A100.
+
+Fixed the same way: PR needs only `sigma_i^2`, which are the eigenvalues of
+the `r x r` Gram matrix, not the singular values of a full `d x r`
+decomposition. `eigh` on the Gram runs on CPU (cuSOLVER rejects batched 4x4
+`eigh` on CUDA 13.0 -- see the earlier note). Verified exact agreement with
+the literal SVD route to 1e-15 relative.
+
 ### `probes.resonance`: measuring the wall instead of inferring it
 
 **Outcome (A100, 2026-09-13): the resonance hypothesis is refuted, and the
