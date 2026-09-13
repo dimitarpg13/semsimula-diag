@@ -465,3 +465,30 @@ def test_per_site_pr_refuses_without_a_layer_index(tmp_path):
                 verbose=False)
     finally:
         pass
+
+
+def test_per_site_pr_works_when_the_forward_uses_autograd_internally():
+    """This model family computes its conservative force inside the forward
+    with torch.autograd.grad(V, h). Running the probe's forward under
+    no_grad therefore breaks the MODEL, not just the measurement:
+    'element 0 of tensors does not require grad and does not have a grad_fn'.
+    Observed on the live model; this fixture reproduces the requirement."""
+    from semsimula_diag.probes import stiffness
+    torch.manual_seed(0)
+    base = _pr_toy()
+
+    class _AutogradForce(type(base)):
+        def _fock_layer_step(self, h, h_prev, r_, sal, m_b, g, dt, layer_idx,
+                             *a, **kw):
+            self.V_theta.context_components(h)
+            hh = h if h.requires_grad else h.detach().requires_grad_(True)
+            V = (hh ** 2).sum() * 0.5                 # a scalar potential
+            f = torch.autograd.grad(V, hh, create_graph=False)[0]
+            return torch.tanh(h - 0.01 * f), h
+
+    model = _AutogradForce()
+    ctx = ProbeContext(model=model, device="cpu",
+                       clip_cfg=GradClipConfig(default_clip=1.0))
+    res = stiffness.sigma_lr_spectrum_by_site(
+        ctx, torch.randint(0, 16, (2, 5)), verbose=False)
+    assert res.metrics["n_sites"] == 6

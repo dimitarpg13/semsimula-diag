@@ -400,7 +400,11 @@ def sigma_lr_spectrum_by_site(ctx: ProbeContext, x: torch.Tensor,
     with patched_attrs(model, {"_fock_layer_step": _wrap_layer}):
         with patched_attrs(model.V_theta, {"context_components": _wrap_comps}):
             with _eval_mode(model):
-                with torch.no_grad():
+                # NOT no_grad: this model family computes its conservative
+                # force inside the forward via torch.autograd.grad(V, h),
+                # so disabling grad breaks the forward itself. The collected
+                # factors are detached individually instead.
+                with torch.enable_grad():
                     model(x)
 
     if not sites:
