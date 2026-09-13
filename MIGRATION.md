@@ -216,6 +216,37 @@ asserts bit-equality on identical inputs, including the `log_tau` /
 `creation_gate` override-ordering trap from Mitigations §49.8. It skips
 cleanly when that checkout is absent (`SEMSIMULA_PAPER` overrides the path).
 
+### Never recover a failed replay in place -- restart
+
+Three separate incidents now share one root cause: a replay that raised
+part-way leaves state in the kernel that the *next* replay walks into.
+
+| symptom | retained by |
+|---|---|
+| `CheckpointError: recomputed values ... different metadata` | a `patched_attrs` generator orphaned by `KeyboardInterrupt`, restored at an arbitrary later GC |
+| `_LinAlgError` then, on re-run, `RuntimeError: ... modified by an inplace operation ... at version 7; expected version 5` | an autograd graph from the previous arm, still referenced after two intervening in-place parameter writes |
+
+The version gap of 2 in the second case is diagnostic: each `_measure`
+arm performs exactly two in-place parameter writes -- the bundle's
+`load_state_dict`, and `restored_model_state`'s restore on exit -- so a
+gap of 2 means the graph being walked was built one arm ago.
+
+The most likely retainer is `model._repulsion_terms`, which
+`model_fock_parf_multixi.pop_repulsion_loss` documents as holding "live
+graph references" between a training forward and its backward. A replay
+aborting between those points leaves it populated. This is not airtight
+(the model resets the list at `layer_idx == 0` of each forward, so it
+partly self-heals) but the pinned graph also retains its entire
+activation set in GPU memory, which is a leak regardless of correctness.
+`replayed()` now calls `_drop_stale_graph_refs(model)` both on entry and
+in its `finally`.
+
+**Operationally: after any exception inside a replay, restart the
+runtime.** Do not re-run the cell, and do not `importlib.reload` --
+reloading updates the code but leaves exactly the graph and buffer state
+that caused the failure. Reload is only safe in a kernel whose last
+replay completed.
+
 ### On the §11.5 golden-output fixtures
 
 The archived probe outputs at steps 70,522 / 71,194 / 71,703 **cannot** be

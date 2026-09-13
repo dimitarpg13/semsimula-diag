@@ -240,6 +240,36 @@ def _install_layer_hook(ctx: ProbeContext, info: ReplayInfo) -> Optional[Callabl
     return lambda: setattr(model, "_fock_layer_step", original)
 
 
+def _drop_stale_graph_refs(model) -> None:
+    """Clear model-side buffers that hold live autograd-graph references.
+
+    ``model_fock_parf_multixi`` accumulates per-layer register-repulsion
+    terms on ``_repulsion_terms`` during a training forward, to be drained
+    by ``pop_repulsion_loss()`` before ``backward()``; its own docstring
+    notes that "the terms hold live graph references".
+
+    A replay that aborts between those two points -- an exception in the
+    forward, or in a gradient-checkpoint recompute during the backward --
+    leaves that list populated. Two consequences, and the second is the
+    one that bites: the pinned graph keeps its whole activation set alive
+    in GPU memory, and a later replay that drains the buffer can walk into
+    a graph built before the intervening ``load_state_dict`` calls bumped
+    every parameter's version counter, which surfaces as
+
+        RuntimeError: one of the variables needed for gradient computation
+        has been modified by an inplace operation ... is at version N;
+        expected version N-2
+
+    where the gap of 2 is exactly one probe arm's two in-place parameter
+    writes (the bundle load, and ``restored_model_state``'s restore).
+
+    Clearing at the top of a replay is safe: nothing valid can be in the
+    buffer before the first forward of this replay has run.
+    """
+    if getattr(model, "_repulsion_terms", None):
+        model._repulsion_terms = []
+
+
 @contextlib.contextmanager
 def replayed(ctx: ProbeContext, bundle: Dict[str, Any], *,
              load_weights: bool = True,
@@ -292,6 +322,7 @@ def replayed(ctx: ProbeContext, bundle: Dict[str, Any], *,
             for p in model.parameters():
                 p.grad = None
             model.train()
+            _drop_stale_graph_refs(model)
 
             cts = ClipThenSum(model, ctx.clip_cfg)
             info.clip_then_sum_groups = sorted(cts.params)
@@ -316,5 +347,6 @@ def replayed(ctx: ProbeContext, bundle: Dict[str, Any], *,
             cts.splice_back()
             yield info
         finally:
+            _drop_stale_graph_refs(model)
             if restore_layer is not None:
                 restore_layer()
