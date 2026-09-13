@@ -82,7 +82,50 @@ reinvent it.
 | `probes.clip_order` | **NO — needs GPU** |
 | `probes.integrator` | **NO — needs GPU** |
 | `probes.tau_saturation.probe_hot_rows` | **NO — needs GPU** (ported later than the rest of this table; same engine, same gap) |
-| `probes.precision_cap.replay_rank_truncation_ablation` | **NO — needs GPU** (built 2026-09-13, was proposed-only in the companion note until now; same gap) |
+| `probes.precision_cap.replay_rank_truncation_ablation` | **NO — needs GPU** (built 2026-09-13, was proposed-only in the companion note until now; same gap). First GPU attempt aborted after 4 h at 3/5 arms — see the note below |
+
+### Rank truncation must not pay the `baoab_cfc_lowrank` tax
+
+The first GPU run of `replay_rank_truncation_ablation` (step 87196, A100,
+2026-09-13) was killed after 4 hours having completed only 3 of its 5
+arms. The cause was in `_svd_truncate`, which called
+`torch.linalg.svd(B)` directly: `B` is `(K, d, r)` **per token**, so at
+`B=8, T=512, K=16, n_ctx=5, L=8` one forward pass issues on the order of
+2.6M batched `384 x 4` decompositions, and the backward differentiates
+through every one of them.
+
+That is the *same* operation, at the same scale, that makes the
+`baoab_cfc_lowrank` integrator arm non-viable — `parf/cfc_baoab.py`
+measures that arm at ~120 s/step vs `baoab_cfc`'s ~10-15 s/step and
+states plainly that "the batched per-token SVD is the entire extra cost".
+A probe built to *diagnose* the low-rank channel had silently taken on
+the cost profile of the arm it diagnoses.
+
+Two corrections, both in `_svd_truncate`:
+
+1. **Don't route it to CPU.** An initial fix moved the SVD to `B.cpu()`.
+   That is backwards: `cfc_baoab.py` engineers a jitter + retry ladder
+   (`_LOWRANK_SVD_JITTER`, `_LOWRANK_SVD_MAX_TRIES`) specifically to keep
+   one ill-conditioned batch element from dragging the batch onto the CPU
+   LAPACK fallback, "which, called per layer per step, is the dominant
+   wall-clock cost". Reverted.
+2. **Use the Gram matrix and a detached projector.** Since `d >> r`,
+   truncation needs only the right singular subspace: `B = U S V^T` gives
+   `B V_{r'} V_{r'}^T` as the exact rank-`r'` truncation, and `V` comes
+   from the `r x r` Gram matrix `B^T B` — a 4x4 `eigh` instead of a
+   384x4 SVD, with `U` never formed. The projector is computed under
+   `no_grad`, so the truncation is the linear map `B @ P` and *nothing*
+   differentiates through the decomposition.
+
+Verified equal to the literal SVD truncation to 1e-13 (double), with the
+achieved rank exactly `r'`. Point 2 also removes a correctness risk, not
+just a cost one: the backward's `1/(sigma_i^2 - sigma_j^2)` terms are
+gone, and zeroing the tail *manufactures* the repeated singular values
+that `cfc_baoab.py` records as making cuSOLVER "return NaN singular
+vectors/values *without raising*". The aborted run's `rank=1` and
+`rank=2` arms both reported `relative_force_error` pinned at ~1.0000 with
+the gradient norm collapsed 2539 -> ~2.9; those numbers were discarded
+rather than trusted, and the ablation should be re-run from scratch.
 
 The replay probes have unit tests covering the engine (weight/grad/RNG
 restoration, restoration on the exception path, clip-then-sum actually

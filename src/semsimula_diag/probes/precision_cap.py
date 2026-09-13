@@ -172,29 +172,52 @@ def _svd_truncate(B: torch.Tensor, rank: int) -> torch.Tensor:
     ``rank = r_full`` arm a built-in fidelity check against the genuinely
     untruncated reference.
 
-    **Why the SVD itself runs on CPU.** ``B`` is a batch of many small
-    matrices (one per well), and this call sits inside the forward pass
-    under autograd, so every element of ``ranks`` differentiates through
-    it once per microbatch. cuSOLVER's batched SVD backward is known to be
-    dramatically slower than CPU LAPACK's for exactly this shape (many
-    small matrices), and the truncation makes it worse: forcing the tail
-    singular values to an identical 0.0 creates repeated singular values,
-    and the SVD backward formula divides by pairwise differences between
-    them -- a ``0/0`` for every such pair. CPU LAPACK's implementation
-    tolerates that near-degenerate case at a survivable cost; cuSOLVER's
-    batched routine does not. Moving only the decomposition to CPU (a
-    differentiable device transfer, so gradients still flow back to
-    ``B`` on its original device) keeps the ablation's semantics
-    unchanged while avoiding both the slowdown and the degeneracy this
-    truncation deliberately introduces.
+    **Why this is a Gram-matrix projection and not a literal SVD.** ``B``
+    is ``(K, d, r)`` *per token* (see ``AnisotropicGaussianVTheta.
+    context_components``: "``B`` alone is ``K * d * rank`` floats per
+    token"), so at the deployed shape a single forward pass would issue
+    on the order of ``B*T*K*n_ctx*L`` batched ``d x r`` decompositions.
+    That is precisely the cost that makes the ``baoab_cfc_lowrank``
+    integrator arm non-viable: ``cfc_baoab.py`` measures it at ~120 s/step
+    against ``baoab_cfc``'s ~10-15 s/step and records "the batched
+    per-token SVD is the entire extra cost". An ablation must not adopt
+    the cost profile of the arm it is diagnosing.
+
+    Two facts make the full SVD avoidable. First, ``d >> r`` (384 vs 4),
+    and truncation only needs the *right* singular subspace: with the thin
+    SVD ``B = U S V^T``, the rank-``r'`` truncation is exactly
+    ``B V_{r'} V_{r'}^T``, since ``V^T V_{r'}`` selects the leading block.
+    ``V`` is obtained from the ``r x r`` Gram matrix ``B^T B = V S^2 V^T``
+    -- a 4x4 ``eigh`` in place of a 384x4 SVD -- and ``U`` is never formed.
+
+    Second, the projector is a *choice of directions*, not a magnitude, so
+    it is computed under ``no_grad`` and the truncation reduces to the
+    linear map ``B @ P``. Gradients therefore flow into ``B`` (and on into
+    the projection weights that produced it) exactly as for any other
+    linear operation, while nothing differentiates through the
+    decomposition itself. That removes the backward's
+    ``1/(sigma_i^2 - sigma_j^2)`` terms outright -- which matters here
+    beyond speed, because zeroing the tail deliberately *manufactures*
+    repeated singular values, and ``cfc_baoab.py`` documents that a
+    degenerate batch element can make cuSOLVER "return NaN singular
+    vectors/values *without raising*", silently poisoning the gradient.
+
+    The forward value is unchanged (still the exact rank-``r'``
+    truncation); only the subspace's own sensitivity is held fixed, which
+    is the intended reading of the ablation -- project the realised well
+    onto its leading directions and ask what the optimizer would then have
+    seen.
     """
     if rank >= B.shape[-1]:
         return B
-    orig_device = B.device
-    U, S, Vh = torch.linalg.svd(B.cpu(), full_matrices=False)
-    S = S.clone()
-    S[..., rank:] = 0.0
-    return (U @ torch.diag_embed(S) @ Vh).to(orig_device)
+    with torch.no_grad():
+        gram = B.transpose(-2, -1) @ B
+        # eigh returns ascending eigenvalues, so the top `rank` directions
+        # are the trailing columns.
+        _, evecs = torch.linalg.eigh(gram)
+        v_top = evecs[..., -rank:]
+        projector = v_top @ v_top.transpose(-2, -1)
+    return B @ projector
 
 
 def replay_rank_truncation_ablation(
