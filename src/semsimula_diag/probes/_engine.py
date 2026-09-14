@@ -26,7 +26,7 @@ from .context import ProbeContext
 
 __all__ = ["ReplayInfo", "replayed", "restored_model_state",
            "patched_attrs", "assert_unpatched", "iter_isolated_rows",
-           "CURRENT_MICROBATCH"]
+           "CURRENT_MICROBATCH", "iter_comps", "rewrap_comps"]
 
 
 @dataclass
@@ -107,6 +107,49 @@ def restored_model_state(ctx: ProbeContext, *, grads: bool = True,
 # the deployed model, which inferred 12 microbatches where there were 4.
 CURRENT_MICROBATCH: "contextvars.ContextVar[int]" = contextvars.ContextVar(
     "semsimula_diag_microbatch", default=0)
+
+
+def _is_bare_comps(comps) -> bool:
+    """True when `comps` is a single (mu, a, w, B) tuple rather than a
+    list of them."""
+    return bool(comps) and torch.is_tensor(comps[0])
+
+
+def iter_comps(comps):
+    """Iterate ``(mu, a, w, B)`` tuples uniformly, regardless of which
+    V_theta bank produced ``comps``.
+
+    ``context_components()`` returns a LIST of per-channel tuples for the
+    additive multi-context bank, but a single BARE tuple for
+    ``JointContextAnisotropicGaussianVTheta`` -- its ``context_components``
+    delegates straight to the single-bank ``_components()``, which returns
+    ``(mu, a, w, B)`` directly, not wrapped in a list, because there is
+    only one unified well set across all channels. Every probe in this
+    package was written against the additive shape; this makes both shapes
+    safe to iterate the same way.
+    """
+    return [comps] if _is_bare_comps(comps) else list(comps)
+
+
+def rewrap_comps(comps, new_tuples):
+    """Inverse of :func:`iter_comps`: restore whatever shape ``comps``
+    originally had, given a (possibly modified) list of tuples.
+
+    This matters beyond bookkeeping. A probe that intercepts
+    ``context_components`` to perturb ``B`` (truncation, matched noise)
+    feeds its return value straight back into the model's own
+    ``forward``/``harmonic_terms`` via the ``comps=`` argument. The joint
+    bank's ``forward`` does ``mu, a, w, B = comps`` -- handing it a
+    one-element LIST instead of the bare tuple it expects breaks the
+    model's actual computation, not just the probe reading it.
+    """
+    if _is_bare_comps(comps):
+        if len(new_tuples) != 1:
+            raise ValueError(
+                f"expected exactly one (mu, a, w, B) tuple to rewrap a bare "
+                f"comps, got {len(new_tuples)}")
+        return new_tuples[0]
+    return new_tuples
 
 
 _ACTIVE_PATCHES = "_semsimula_diag_active_patches"

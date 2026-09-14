@@ -21,8 +21,8 @@ import torch
 
 from ..clipping import per_group_grad_norms
 from ..report import ProbeResult
-from ._engine import (assert_unpatched, patched_attrs, replayed,
-                      restored_model_state)
+from ._engine import (assert_unpatched, iter_comps, patched_attrs, replayed,
+                      restored_model_state, rewrap_comps)
 from .context import ProbeContext
 
 __all__ = ["replay_precision_cap_ablation", "replay_curvature_rebalance_ablation",
@@ -382,8 +382,9 @@ def replay_rank_truncation_ablation(
             def _make_wrapper(original):
                 def _wrapped(xis):
                     comps = original(xis)
-                    return [(mu, a, w, _svd_truncate(B, rank) if B.shape[-1] else B)
-                            for (mu, a, w, B) in comps]
+                    out_c = [(mu, a, w, _svd_truncate(B, rank) if B.shape[-1] else B)
+                            for (mu, a, w, B) in iter_comps(comps)]
+                    return rewrap_comps(comps, out_c)
                 return _wrapped
             cm = patched_attrs(ctx.model.V_theta,
                                {"context_components": _make_wrapper})
@@ -491,8 +492,9 @@ def replay_rank_perturbation_control(
         else:
             def _make_wrapper(original):
                 def _wrapped(xis):
+                    comps = original(xis)
                     out_c = []
-                    for (mu, a, w, B) in original(xis):
+                    for (mu, a, w, B) in iter_comps(comps):
                         if B.shape[-1]:
                             noise = _matched_noise(B, rank, seed)
                             with torch.no_grad():
@@ -501,7 +503,7 @@ def replay_rank_perturbation_control(
                                         min=1e-12)).detach())
                             B = B + noise
                         out_c.append((mu, a, w, B))
-                    return out_c
+                    return rewrap_comps(comps, out_c)
                 return _wrapped
             cm = patched_attrs(ctx.model.V_theta,
                                {"context_components": _make_wrapper})

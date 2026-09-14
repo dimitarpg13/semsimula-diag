@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 import torch
 
 from ..report import ProbeResult
-from ._engine import patched_attrs
+from ._engine import iter_comps, patched_attrs
 from .context import ProbeContext
 
 __all__ = [
@@ -83,8 +83,10 @@ def _record_context_components(ctx: ProbeContext, x: torch.Tensor,
 
     def _recording(xis):
         comps = original(xis)
-        # comps: list of (mu, a, w, B) per xi-channel
-        for (_mu, _a, _w, B) in comps:
+        # additive bank: list of (mu, a, w, B), one per channel.
+        # joint bank: a single bare (mu, a, w, B) tuple -- iter_comps
+        # normalizes both to the same shape for reading.
+        for (_mu, _a, _w, B) in iter_comps(comps):
             if B.shape[-1] == 0:
                 continue
             collect(B)
@@ -386,7 +388,7 @@ def sigma_lr_spectrum_by_site(ctx: ProbeContext, x: torch.Tensor,
     def _wrap_comps(original):
         def _w(xis):
             comps = original(xis)
-            for ch, (_mu, _a, _w_, B) in enumerate(comps):
+            for ch, (_mu, _a, _w_, B) in enumerate(iter_comps(comps)):
                 if B.shape[-1] == 0:
                     continue
                 # PR needs only sigma_i^2, which are the eigenvalues of

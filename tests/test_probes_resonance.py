@@ -509,3 +509,95 @@ def test_sigma_lr_spectrum_report_does_not_call_svdvals_on_the_wide_axis():
     assert "svdvals" not in src, (
         "sigma_lr_spectrum_report calls torch.linalg.svdvals directly again -- "
         "this regresses the cuSOLVER batched-SVD cost bug fixed 2026-09-13")
+
+
+# --- joint-bank context_components compatibility -------------------------
+# JointContextAnisotropicGaussianVTheta.context_components returns a BARE
+# (mu, a, w, B) tuple (one unified well set), not a list of them (one per
+# channel) like the additive bank. Every probe that hooks
+# context_components was written against the additive shape; this section
+# is the first fixture that exercises the other one.
+
+def test_iter_comps_normalizes_both_shapes():
+    from semsimula_diag.probes._engine import iter_comps
+    mu, a, w, B = (torch.randn(3), torch.randn(3), torch.randn(3), torch.randn(3, 2))
+    bare = (mu, a, w, B)
+    listed = [bare, bare]
+    assert iter_comps(bare) == [bare]
+    assert iter_comps(listed) == listed
+
+
+def test_rewrap_comps_restores_bare_tuple_shape():
+    from semsimula_diag.probes._engine import iter_comps, rewrap_comps
+    mu, a, w, B = (torch.randn(3), torch.randn(3), torch.randn(3), torch.randn(3, 2))
+    bare = (mu, a, w, B)
+    out = rewrap_comps(bare, [(mu, a, w, B * 2)])
+    assert isinstance(out, tuple) and torch.equal(out[3], B * 2)
+
+    listed = [bare, bare]
+    out2 = rewrap_comps(listed, [(mu, a, w, B * 2)] * 2)
+    assert isinstance(out2, list) and len(out2) == 2
+
+
+def test_rewrap_comps_rejects_wrong_count_for_bare_tuple():
+    from semsimula_diag.probes._engine import rewrap_comps
+    mu, a, w, B = (torch.randn(3), torch.randn(3), torch.randn(3), torch.randn(3, 2))
+    bare = (mu, a, w, B)
+    with pytest.raises(ValueError):
+        rewrap_comps(bare, [(mu, a, w, B), (mu, a, w, B)])
+
+
+class _JointStyleVTheta(_ToyVTheta):
+    """Mirrors JointContextAnisotropicGaussianVTheta's comps convention:
+    context_components returns a BARE (mu,a,w,B) tuple, and every consumer
+    of a passed-in `comps` unpacks it directly (`mu, a, w, B = comps`),
+    not `comps[0]`. The additive _ToyVTheta used everywhere else in this
+    file returns a one-element LIST and indexes with comps[0][3]; that
+    shape is what every probe was originally written against, and is
+    exactly what this class must NOT match, to catch this class of bug."""
+
+    def context_components(self, xis):
+        return super().context_components(xis)[0]   # unwrap the list
+
+    def harmonic_terms_lowrank(self, xis, h, *, comps=None):
+        B = self._B(xis) if comps is None else comps[3]
+        G = B.reshape(*B.shape[:-3], self.d, self.K * self.r)
+        return torch.ones_like(h), h, G, G.new_zeros(G.shape[:-2] + (G.shape[-1],))
+
+
+def test_precision_cap_probes_survive_the_joint_bank_shape(tmp_path):
+    """Each of these hooks context_components and feeds a (possibly
+    modified) result back into the model via comps=. Getting the shape
+    wrong here breaks the model's own forward, not just the probe."""
+    from semsimula_diag.probes import precision_cap
+
+    torch.manual_seed(0)
+    model = _ToyModel()
+    model.V_theta = _JointStyleVTheta(d=6)
+    rows = np.random.RandomState(0).randint(0, 16, size=(2, 5)).astype(np.int64)
+    bundle = {"step": 42, "grad_accum": 1, "batches": [(rows, rows)],
+              "model_state_dict": model.state_dict(),
+              "rng_state_cpu": torch.get_rng_state(), "rng_state_cuda": None,
+              "pre_clip_grad_norm": 1.0, "top_groups": {}}
+    ck = tmp_path / "joint"; ck.mkdir()
+    torch.save(bundle, ck / "run_step42_spikebatch.pt")
+    ctx = ProbeContext(model=model, device="cpu",
+                       store=BundleStore(ckpt_dir=ck, ckpt_prefix="run",
+                                        archive_root=tmp_path, verbose=False),
+                       clip_cfg=GradClipConfig(default_clip=10.0),
+                       forward_fn=_forward_fn)
+
+    out_t = precision_cap.replay_rank_truncation_ablation(ctx, 42, ranks=(2,),
+                                                          verbose=False)
+    assert out_t["rank=2"].metrics["pre_clip_grad_norm"] >= 0
+
+    out_p = precision_cap.replay_rank_perturbation_control(ctx, 42, ranks=(2,),
+                                                            verbose=False)
+    assert out_p["noise matched to rank=2"].metrics["pre_clip_grad_norm"] >= 0
+
+    out_o = resonance.omega_dt_under_truncation(ctx, 42, _FakeIntegratorModule,
+                                                ranks=(2,), verbose=False)
+    assert "rank=2" in out_o
+
+    tail = resonance.tail_coherence_report(ctx, 42, verbose=False)
+    assert tail.metrics["tail_pr_p50"] >= 1.0

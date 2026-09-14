@@ -355,6 +355,44 @@ decomposition. `eigh` on the Gram runs on CPU (cuSOLVER rejects batched 4x4
 `eigh` on CUDA 13.0 -- see the earlier note). Verified exact agreement with
 the literal SVD route to 1e-15 relative.
 
+### Every context_components() consumer assumed the additive bank's shape
+
+Caught before it reached the joint-coupling training run, not after.
+`AnisotropicMultiContextGaussianVTheta.context_components` (additive, one
+bank per channel) returns a LIST of `(mu, a, w, B)` tuples.
+`JointContextAnisotropicGaussianVTheta.context_components` (one unified
+bank across all channels) delegates straight to the single-bank
+`_components()`, which returns a single BARE tuple -- not wrapped in a
+list, because there is only one well set. Every probe in this package
+that hooks `context_components` -- six sites across `stiffness.py`,
+`resonance.py` and `precision_cap.py` -- was written and tested only
+against the additive shape (`for (mu, a, w, B) in comps: ...`), which
+misiterates over a bare tuple's four tensors as if they were four
+sub-tuples.
+
+Three of the six sites are worse than a probe-side bug: they *replace*
+`context_components` to perturb `B` (rank truncation, matched noise), and
+their return value is fed straight back into the model's own
+`forward`/`harmonic_terms` via `comps=`. Returning a list where the model
+expects a bare tuple breaks the model's actual computation, not just the
+diagnostic reading it.
+
+Fixed with two shared helpers in `_engine.py`: `iter_comps(comps)`
+normalizes either shape to a list for reading, and `rewrap_comps(comps,
+new_tuples)` restores whichever shape `comps` originally had, so a
+perturbing hook can modify `B` and hand back something the model can
+actually consume. Read-only sites use only `iter_comps`; the three
+write-back sites use both.
+
+Caught by building a second toy fixture (`_JointStyleVTheta`) whose
+`context_components` returns the bare-tuple shape -- the existing
+fixture, like every other test in the suite until now, only ever
+exercised the additive shape, which is exactly how six sites carried this
+for as long as they did. A new test runs all four affected public
+functions (`replay_rank_truncation_ablation`,
+`replay_rank_perturbation_control`, `omega_dt_under_truncation`,
+`tail_coherence_report`) against it end-to-end.
+
 ### `probes.resonance`: measuring the wall instead of inferring it
 
 **Outcome (A100, 2026-09-13): the resonance hypothesis is refuted, and the

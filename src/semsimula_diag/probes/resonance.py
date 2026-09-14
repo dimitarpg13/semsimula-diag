@@ -36,8 +36,8 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence
 import torch
 
 from ..report import ProbeResult
-from ._engine import (CURRENT_MICROBATCH, patched_attrs, replayed,
-                      restored_model_state)
+from ._engine import (CURRENT_MICROBATCH, iter_comps, patched_attrs,
+                      replayed, restored_model_state, rewrap_comps)
 from .precision_cap import _svd_truncate
 from .context import ProbeContext
 
@@ -326,7 +326,7 @@ def tail_coherence_report(
         def _wrapped(xis):
             comps = original(xis)
             with torch.no_grad():
-                for (_mu, _a, _w, B) in comps:
+                for (_mu, _a, _w, B) in iter_comps(comps):
                     if B.shape[-1] < 2:
                         continue
                     gram = (B.transpose(-2, -1) @ B).cpu()
@@ -400,9 +400,11 @@ def omega_dt_under_truncation(
         else:
             def _make(original):
                 def _wrapped(xis):
-                    return [(mu, a, w,
+                    comps = original(xis)
+                    out_c = [(mu, a, w,
                              _svd_truncate(B, rank) if B.shape[-1] else B)
-                            for (mu, a, w, B) in original(xis)]
+                            for (mu, a, w, B) in iter_comps(comps)]
+                    return rewrap_comps(comps, out_c)
                 return _wrapped
             cm = patched_attrs(ctx.model.V_theta,
                                {"context_components": _make})
