@@ -50,17 +50,6 @@ def _require_aniso(model, attr: str) -> None:
 
 
 @contextlib.contextmanager
-def _patched(obj: Any, attr: str, replacement) -> Iterator[None]:
-    """Swap a bound method, guaranteeing restoration."""
-    original = getattr(obj, attr)
-    setattr(obj, attr, replacement)
-    try:
-        yield original
-    finally:
-        setattr(obj, attr, original)
-
-
-@contextlib.contextmanager
 def _eval_mode(model) -> Iterator[None]:
     was_training = model.training
     model.eval()
@@ -101,7 +90,7 @@ def _record_context_components(ctx: ProbeContext, x: torch.Tensor,
             collect(B)
         return comps
 
-    with _patched(model.V_theta, "context_components", _recording), \
+    with patched_attrs(model.V_theta, {"context_components": lambda _orig: _recording}), \
             _eval_mode(model):
         with torch.enable_grad():
             model(x)
@@ -129,7 +118,7 @@ def stiffness_report(ctx: ProbeContext, x: torch.Tensor,
     # The wall is a property of the baoab_cfc explicit kick, so measure
     # under that integrator regardless of how the model is configured.
     saved = (model.cfg.integrator, model.cfg.vtheta_analytic_force)
-    with _patched(model.V_theta, "harmonic_terms", _recording):
+    with patched_attrs(model.V_theta, {"harmonic_terms": lambda _orig: _recording}):
         model.cfg.integrator, model.cfg.vtheta_analytic_force = 'baoab_cfc', True
         try:
             with _eval_mode(model), torch.enable_grad():
@@ -200,8 +189,18 @@ def sigma_lr_spectrum_report(ctx: ProbeContext, x: torch.Tensor) -> ProbeResult:
     svals: List[torch.Tensor] = []
 
     def _collect(B: torch.Tensor) -> None:
-        s = torch.linalg.svdvals(B)                 # (..., K, r), descending
-        svals.append(s.detach().float().reshape(-1, s.shape[-1]).cpu())
+        # sigma_i(B) = sqrt(eig_i(B^T B)): PR, fro2 and spec below only ever
+        # use sigma_i^2, so the r x r Gram eigh gives everything this needs
+        # without U and without cuSOLVER's batched d x r SVD -- at the
+        # deployed shape that SVD is ~1.3M batched 384x4 decompositions per
+        # forward across 40 (layer, channel) sites, which is what made this
+        # function hang for 6+ minutes on real hardware. eigh runs on CPU
+        # because cuSOLVER also rejects batched 4x4 eigh on CUDA 13.0.
+        Bd = B.detach()
+        gram = (Bd.transpose(-2, -1) @ Bd).cpu().double()
+        s2 = torch.linalg.eigvalsh(gram).clamp(min=0.0).flip(-1)   # descending
+        s = s2.sqrt().float().reshape(-1, s2.shape[-1])
+        svals.append(s.cpu())
 
     _record_context_components(ctx, x, _collect)
     if not svals:

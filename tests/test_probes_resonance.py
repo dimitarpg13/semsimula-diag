@@ -492,3 +492,20 @@ def test_per_site_pr_works_when_the_forward_uses_autograd_internally():
     res = stiffness.sigma_lr_spectrum_by_site(
         ctx, torch.randint(0, 16, (2, 5)), verbose=False)
     assert res.metrics["n_sites"] == 6
+
+
+def test_sigma_lr_spectrum_report_does_not_call_svdvals_on_the_wide_axis():
+    """torch.linalg.svdvals on the full (..., d, r) factor is what made this
+    function hang for 6+ minutes on real hardware -- at the deployed shape
+    it is ~1.3M batched 384x4 decompositions per forward. The fix routes
+    through the r x r Gram matrix instead (see _svd_truncate for the same
+    fix, and MIGRATION.md for the repeated pattern). Guard against silent
+    regression back to the expensive call by checking the source, since a
+    correctness test alone (already covered above) cannot distinguish fast
+    from catastrophically slow."""
+    import inspect
+    from semsimula_diag.probes import stiffness
+    src = inspect.getsource(stiffness.sigma_lr_spectrum_report)
+    assert "svdvals" not in src, (
+        "sigma_lr_spectrum_report calls torch.linalg.svdvals directly again -- "
+        "this regresses the cuSOLVER batched-SVD cost bug fixed 2026-09-13")
