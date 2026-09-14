@@ -373,6 +373,7 @@ def sigma_lr_spectrum_by_site(ctx: ProbeContext, x: torch.Tensor,
             "sigma_lr_spectrum_report for the pooled view instead.")
 
     sites: Dict[tuple, List[torch.Tensor]] = {}
+    fros: Dict[tuple, List[torch.Tensor]] = {}
     cur = {"layer": 0}
 
     def _wrap_layer(original):
@@ -399,8 +400,10 @@ def sigma_lr_spectrum_by_site(ctx: ProbeContext, x: torch.Tensor,
                 gram = (Bd.transpose(-2, -1) @ Bd).cpu().double()
                 s2 = torch.linalg.eigvalsh(gram).clamp(min=0.0)
                 s2 = s2.reshape(-1, s2.shape[-1])
-                pr = (s2.sum(-1) ** 2) / (s2 ** 2).sum(-1).clamp(min=1e-300)
+                fro2 = s2.sum(-1)
+                pr = (fro2 ** 2) / (s2 ** 2).sum(-1).clamp(min=1e-300)
                 sites.setdefault((cur["layer"], ch), []).append(pr)
+                fros.setdefault((cur["layer"], ch), []).append(fro2.sqrt())
             return comps
         return _w
 
@@ -419,6 +422,7 @@ def sigma_lr_spectrum_by_site(ctx: ProbeContext, x: torch.Tensor,
                            metrics={"n_sites": 0})
 
     per_site = {k: torch.cat(v) for k, v in sorted(sites.items())}
+    per_fro = {k: torch.cat(v) for k, v in sorted(fros.items())}
     medians = torch.tensor([v.median() for v in per_site.values()],
                            dtype=torch.float64)
     within = torch.tensor([v.std() for v in per_site.values()],
@@ -441,9 +445,32 @@ def sigma_lr_spectrum_by_site(ctx: ProbeContext, x: torch.Tensor,
               f"spread {float(medians.max() - medians.min()):.2f}")
         print(f"between-site std {between_std:.3f} | within-site std {within_std:.3f}"
               f" | between_frac {frac:.2f}")
-        print("  -> " + ("STRUCTURED: per-bank rank is the better instrument"
-                         if frac > 0.5 else
-                         "HOMOGENEOUS: a single global rank is appropriate"))
+        lab = ("HOMOGENEOUS: a single global rank is appropriate" if frac < 0.10
+               else "MILD STRUCTURE: a global rank is defensible" if frac < 0.30
+               else "STRUCTURED: per-site rank allocation is the better instrument")
+        print(f"  -> {lab}")
+        # which axis carries it -- per-bank and per-layer are different fixes
+        n_ch = 1 + max(k[1] for k in per_site)
+        n_la = 1 + max(k[0] for k in per_site)
+        ch_m = [float(torch.tensor([float(per_site[(l, c)].median())
+                                    for l in range(n_la) if (l, c) in per_site]).mean())
+                for c in range(n_ch)]
+        la_m = [float(torch.tensor([float(per_site[(l, c)].median())
+                                    for c in range(n_ch) if (l, c) in per_site]).mean())
+                for l in range(n_la)]
+        print(f"     channel means {[round(v, 2) for v in ch_m]}"
+              f"  range {max(ch_m) - min(ch_m):.2f}")
+        print(f"     layer   means {[round(v, 2) for v in la_m]}"
+              f"  range {max(la_m) - min(la_m):.2f}")
+        print(f"     -> carried mainly by "
+              f"{'CHANNEL' if max(ch_m) - min(ch_m) > max(la_m) - min(la_m) else 'LAYER'}")
+        print("\n     ||B||_F per site (cap = sqrt(precision_lr_max)):")
+        print(f"{'layer':>6}" + "".join(f"{f'ch{c}':>9}" for c in range(n_ch)))
+        for li in range(n_la):
+            row = "".join(f"{float(per_fro[(li, c)].median()):>9.3f}"
+                          if (li, c) in per_fro else f"{'--':>9}"
+                          for c in range(n_ch))
+            print(f"{li:>6}{row}")
 
     return ProbeResult(
         probe_name="sigma_lr_spectrum_by_site",
