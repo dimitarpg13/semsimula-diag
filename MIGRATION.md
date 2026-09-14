@@ -74,7 +74,7 @@ reinvent it.
 |---|---|
 | `clipping`, `replay`, `report` | yes — bit-equality parity vs the notebook original |
 | `probes.tokens` | yes — CPU, against real bundles |
-| `probes.stiffness` | yes — CPU, against real step-87196 weights |
+| `probes.stiffness` | yes — CPU, against real step-87196 weights; `sigma_lr_spectrum_by_site` added 2026-09-13 and GPU-verified at step 96410 |
 | `probes.tau_saturation` | yes — CPU; `tau_min` 5.22 @ register 14 matches the live training log |
 | `probes.layer_profile` | **NO — needs GPU** |
 | `probes.row_attribution` | **NO — needs GPU** |
@@ -296,6 +296,49 @@ Separately, step 87196 is an outlier by construction and therefore the
 worst checkpoint on which to ask whether the model uses its rank budget.
 The rank decision wants the same ablation on a healthy checkpoint, where
 `ntp` remains the column to read.
+
+### The rank strand: what the 2026-09-13 battery established
+
+`sigma_lr_spectrum_by_site` was built because the pooled
+`sigma_lr_spectrum_report` answers "is the budget used?" but not "is it used
+evenly?", and those are different decisions. Measured at step 96410 over 40
+(layer, channel) sites:
+
+| | value |
+|---|---|
+| `||B||_F` | **1.000 at every site** — the cap binds uniformly |
+| PR by channel | 3.18, 3.74, 3.82, 3.64, 3.61 (range **0.65**) |
+| PR by layer | 3.36 - 3.70 (range 0.33) |
+| `between_frac` | **0.39** |
+| random-init null | **3.96** |
+
+Three things follow, and all three contradict what the pooled report had been
+read as saying:
+
+1. **PR must be read against the random null, not against `r`.** A random
+   `d x r` Gaussian is already near-flat, so an untrained model scores 3.96 of
+   4. Training moves PR *down*. "PR near the ceiling" is what no learning looks
+   like.
+2. **The structure is carried by channel, not layer**, at twice the spread --
+   so per-channel (per-bank) rank is the targeted change, not a global bump.
+3. **Uniform cap binding means the PR spread is pure redistribution.** No
+   channel is idle; they hold identical budgets and spread them differently.
+
+Two methodology traps worth carrying forward:
+
+**Load checkpoint weights explicitly.** An entire session of measurements was
+taken on randomly-initialised weights because Cell 2's auto-resume failed
+*silently* -- no error, just an untrained model. Probes that rely on ambient
+`model` state inherit that. Use `_restored_weights` + `_load_weights_into` and
+the result is correct regardless. The tell was a step change: PR frozen to 0.2%
+across seven checkpoints, then jumping 7% with `between_frac` collapsing 40x.
+A quick weight-norm check catches it (`register_embed` is 6.97 trained against
+0.11 at init -- a 62x separation).
+
+**Pooled quantiles hide site structure.** Same shape as the three engine bugs
+above: fine while only aggregates are wanted, load-bearing the moment the
+question becomes *where*. The pooled `pr_p05 = 2.50 ... pr_p95 = 3.91` gave no
+way to tell whether that spread was noise or organised by channel.
 
 ### `sigma_lr_spectrum_by_site` shipped with the same cuSOLVER trap
 
