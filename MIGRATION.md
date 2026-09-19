@@ -39,6 +39,41 @@ trained factorisation might still recover. SVD truncation is optimal in
 Frobenius norm, not for the task, so it lower-bounds what a trained
 factorisation could reach.
 
+**First result, d=384 step 28,500 (2026-09-19).** The proposal the module
+was written to test does not survive it. Spectrum, against a maximum
+possible rank of 1920:
+
+| map | shape | PR | r@0.9 | r@0.99 | break-even |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `B_proj` | (12288, 1920) | 421.9 | 707 | 1506 | 1661 |
+| `mu_proj` | (3072, 1920) | 92.0 | 668 | 1483 | 1182 |
+| `a_proj` | (3072, 1920) | 5.7 | 242 | 773 | 1182 |
+
+`mu_proj` needs rank 1483 to retain 99% of its energy and breaks even at
+1182: no faithful factorisation of it is also a saving. The uniform sweep
+(12 fixed batches, 24,576 tokens, paired -- the same batches for every row,
+so the deltas carry no sampling noise) gives baseline ppl 84.96 and
+
+| rank | of full | ppl | d ppl |
+| ---: | ---: | ---: | ---: |
+| 1024 | 70.0% | 85.25 | +0.29 |
+| 512 | 35.0% | 90.65 | +5.69 |
+| 256 | 17.5% | 117.30 | +32.34 |
+| 128 | 8.8% | 175.74 | +90.78 |
+
+So the 1441:1 generate-to-use ratio does **not** mean the generator's
+parameters are idle. They carry loss, monotonically. Rank 1024 is the one
+cheap operating point -- 30% of the generator removed for +0.3% ppl.
+
+**Why `per_map_truncation` exists.** `a_proj` reaches 90% of its energy by
+rank 242 while `B_proj` needs 707, so the uniform sweep is still gutting
+`B_proj` at ranks where `a_proj` is nearly intact. A mixed allocation
+(`B_proj`/`mu_proj` at 1024, `a_proj` at 256) costs 20.94M against uniform
+1024's 24.77M -- 3.83M more saved at what should be near-identical loss.
+`allocation_from_energy` builds such an allocation from the measured
+spectrum, and `cap_at_break_even=True` clamps each map to `mn/(m+n)` so an
+allocation cannot ask for an expansion and report it as a saving.
+
 ---
 
 Tracks the port of the CfC/BAOAB notebook diagnostics into `semsimula_diag`,

@@ -111,3 +111,107 @@ def test_missing_vtheta_is_an_explicit_error():
     with pytest.raises(ValueError, match="no V_theta"):
         generator_rank.generator_spectrum(
             ProbeContext(model=nn.Linear(4, 4), device="cpu"), verbose=False)
+
+
+# ---------------------------------------------------------------------------
+# per-map allocation
+# ---------------------------------------------------------------------------
+
+def test_per_map_uses_each_maps_own_rank():
+    """The point of the variant: a diffuse map and a concentrated one get
+    different ranks, and the reported parameter count reflects both."""
+    m = _Model()
+    _plant(m.V_theta.B_proj, rank=40)
+    _plant(m.V_theta.mu_proj, rank=40)
+    _plant(m.V_theta.a_proj, rank=3)
+    res = generator_rank.per_map_truncation(
+        ProbeContext(model=m, device="cpu"), lambda: 2.0,
+        allocations=[{"B_proj": 40, "mu_proj": 40, "a_proj": 4}],
+        verbose=False)
+    row = res.raw["rows"][0]
+    o_B, i_B = m.V_theta.B_proj.weight.shape
+    o_m, i_m = m.V_theta.mu_proj.weight.shape
+    o_a, i_a = m.V_theta.a_proj.weight.shape
+    assert row["factorised_params"] == (
+        40 * (o_B + i_B) + 40 * (o_m + i_m) + 4 * (o_a + i_a))
+
+
+def test_per_map_label_defaults_are_readable():
+    m = _Model()
+    res = generator_rank.per_map_truncation(
+        ProbeContext(model=m, device="cpu"), lambda: 2.0,
+        allocations=[{"B_proj": 64, "mu_proj": 64, "a_proj": 16}],
+        verbose=False)
+    label = res.raw["rows"][0]["label"]
+    assert "B:64" in label and "a:16" in label
+
+
+def test_per_map_rejects_an_incomplete_allocation():
+    """Leaving a map out would leave it dense while the reported saving
+    assumed it had been truncated."""
+    m = _Model()
+    with pytest.raises(KeyError, match="does not cover"):
+        generator_rank.per_map_truncation(
+            ProbeContext(model=m, device="cpu"), lambda: 2.0,
+            allocations=[{"B_proj": 8}], verbose=False)
+
+
+def test_per_map_rejects_an_unknown_key():
+    m = _Model()
+    with pytest.raises(KeyError, match="matches no generator map"):
+        generator_rank.per_map_truncation(
+            ProbeContext(model=m, device="cpu"), lambda: 2.0,
+            allocations=[{"B_proj": 8, "mu_proj": 8, "a_proj": 8,
+                          "w_proj": 8}], verbose=False)
+
+
+def test_per_map_restores_weights_when_evaluate_raises():
+    m = _Model()
+    _plant(m.V_theta.B_proj, rank=8)
+    before = {n: p.detach().clone() for n, p in m.V_theta.named_parameters()}
+
+    def boom():
+        raise RuntimeError("eval blew up")
+
+    with pytest.raises(RuntimeError):
+        generator_rank.per_map_truncation(
+            ProbeContext(model=m, device="cpu"), boom,
+            allocations=[{"B_proj": 4, "mu_proj": 4, "a_proj": 4}],
+            verbose=False)
+    for n, p in m.V_theta.named_parameters():
+        assert torch.allclose(p, before[n]), f"{n} left truncated"
+
+
+def test_break_even_rank_matches_the_closed_form():
+    m = _Model()
+    be = generator_rank.break_even_ranks(ProbeContext(model=m, device="cpu"))
+    o, i = m.V_theta.B_proj.weight.shape
+    assert be["B_proj.weight"] == pytest.approx(o * i / (o + i))
+
+
+def test_allocation_from_energy_tracks_each_spectrum():
+    """A concentrated map must be allocated a lower rank than a diffuse one."""
+    m = _Model()
+    _plant(m.V_theta.B_proj, rank=40)
+    _plant(m.V_theta.a_proj, rank=3)
+    alloc = generator_rank.allocation_from_energy(
+        ProbeContext(model=m, device="cpu"), 0.99, verbose=False)
+    assert alloc["a_proj.weight"] < alloc["B_proj.weight"]
+    assert alloc["a_proj.weight"] <= 3
+
+
+def test_allocation_cap_never_exceeds_break_even():
+    """Uncapped, a full-rank map asks for a factorisation bigger than the
+    dense matrix it replaces. The cap is what makes the saving real."""
+    m = _Model()
+    ctx = ProbeContext(model=m, device="cpu")
+    torch.manual_seed(0)
+    with torch.no_grad():                     # dense random -> near full rank
+        m.V_theta.mu_proj.weight.normal_()
+    be = generator_rank.break_even_ranks(ctx)
+    uncapped = generator_rank.allocation_from_energy(ctx, 0.99, verbose=False)
+    capped = generator_rank.allocation_from_energy(
+        ctx, 0.99, cap_at_break_even=True, verbose=False)
+    assert uncapped["mu_proj.weight"] > be["mu_proj.weight"]
+    for n, r in capped.items():
+        assert r <= be[n] + 1e-9
