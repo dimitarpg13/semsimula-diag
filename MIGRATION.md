@@ -1,5 +1,46 @@
 # Migration status
 
+## `probes.generator_rank` — added 2026-09-19
+
+Not a port. This family has no notebook ancestor; it was written directly
+against the question raised by `Fock_Inference_Productionization_Plan.md`
+§2.3 and §6.
+
+**What it measures.** `V_theta` generates its well bank per token per layer
+through three dense maps from the concatenated `xi` context — `W_mu`,
+`W_a` (`xi_dim -> K*d`) and `W_B` (`xi_dim -> K*d*rank`). At the deployed
+shape these carry 35.4M parameters, 93.9% of the model's non-embedding
+total and 87.6% of its per-token inference cost, against 24576 MAC of
+actual *use*: a generate-to-use ratio of 1441:1. The plan proposes
+factorising them through a bottleneck. `generator_spectrum` reads the
+singular spectrum of each map; `truncation_sweep` truncates in place and
+re-evaluates, restoring the weights in a `finally`.
+
+**Distinct from `probes.precision_cap`.** That truncates the *realised*
+`B_k`, shape `(..., d, rank)` per token, with a Gram shortcut because a
+literal per-token SVD is the cost that makes `baoab_cfc_lowrank`
+non-viable. It answers whether `ANISO_RANK = 4` is needed, and
+`probes.stiffness` already found a participation ratio of 3.68 against 4 —
+all four columns used. `generator_rank` truncates a single 2-D weight
+once, and answers how many of the `xi_dim` *input* directions the generator
+needs. That has never been measured.
+
+**Status: CPU-verified, no GPU dependency.** Weight-only for
+`generator_spectrum`; `truncation_sweep` needs an `evaluate_fn` supplied by
+the caller. Tests plant known low-rank structure and check it is recovered,
+that an all-zero map reports rank 0 rather than `nan` (a freshly built bank
+zero-initialises `a_proj` and `w_proj`, so this is a real input), and that
+weights are restored even when `evaluate_fn` raises.
+
+**Reading the result.** Survival of truncation at rank r is strong evidence
+that the directions beyond r were doing nothing, since the model had no
+opportunity to adapt. Collapse is weaker evidence the other way, because a
+trained factorisation might still recover. SVD truncation is optimal in
+Frobenius norm, not for the task, so it lower-bounds what a trained
+factorisation could reach.
+
+---
+
 Tracks the port of the CfC/BAOAB notebook diagnostics into `semsimula_diag`,
 following the module layout in `semsimula-paper`'s
 `companion_notes/Diagnostic_Programme_in_CfC_BAOAB_Integrator.md` §11.2–§11.3
