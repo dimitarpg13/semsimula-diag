@@ -9,36 +9,55 @@ Design follows `companion_notes/Diagnostic_Programme_in_CfC_BAOAB_Integrator.md`
 §11 in the [semsimula-paper](https://github.com/dimitarpg13/semsimula-paper)
 repo. See [MIGRATION.md](MIGRATION.md) for what is ported so far.
 
-> ## ⚠️ GPU verification pending
+> ## Verification status — library port vs notebook original
 >
-> All notebook probe families are now ported, but **the replay-based probes
-> have not yet been verified against the live model on an A100**:
+> **The methods here are not untested — the *library port* of some of them is.**
+> These probes were extracted from the CfC/BAOAB training notebooks, where they
+> did the work they were built for: the inline `Cell 6d` gradient-spike replay
+> forensics produced the energy/probability spike diagnosis that motivated the
+> move away from Velocity-Verlet, and stiffness and resonance monitoring ran
+> throughout the CfC+BAOAB runs. What the table tracks is whether the
+> *extracted module* has been shown to reproduce that behaviour, on GPU,
+> against known-good values.
 >
-> | module | status |
+> | module | port verified? |
 > |---|---|
-> | `probes.layer_profile` | **unverified** — needs GPU |
-> | `probes.row_attribution` | **unverified** — needs GPU |
-> | `probes.precision_cap` | **unverified** — needs GPU |
-> | `probes.clip_order` | **unverified** — needs GPU |
-> | `probes.integrator` | **unverified** — needs GPU |
-| `probes.tau_saturation.probe_hot_rows` | **unverified** — needs GPU (ported after the rest; same gap) |
-> | `probes.stiffness` | verified on CPU against the real step-87196 weights |
-> | `probes.tau_saturation` | verified on CPU (`tau_min` 5.22 @ register 14 matches the live log) |
-> | `probes.tokens` | verified on CPU against real bundles |
-> | `clipping`, `replay`, `report` | verified; bit-equality parity tests vs the notebook original |
+> | `clipping`, `replay`, `report` | **yes** — bit-equality parity vs the notebook original |
+> | `probes.stiffness` | **yes** — CPU against real step-87196 weights; `sigma_lr_spectrum_by_site` GPU-verified at step 96410 |
+> | `probes.resonance` | **yes** — GPU, steps 87196 / 86201 / 90360; max `omega*dt` 1.50–1.52, 0.000% of tokens over the wall; power iteration cross-checked against `eigvalsh` on CPU. **But see the open caveat below.** |
+> | `probes.precision_cap.replay_rank_truncation_ablation` | **yes** — GPU, step 87196; the `rank=4` arm reproduces the untruncated reference exactly (2539.20, error 0.0000) |
+> | `probes.tau_saturation` | **yes** — CPU; `tau_min` 5.22 @ register 14 matches the live training log |
+> | `probes.tokens` | **yes** — CPU, against real bundles |
+> | `probes.generator_rank` | exercised from 4 CfC+BAOAB notebooks; no known-good reference recorded |
+> | `probes.layer_profile` | **port unverified** — needs a GPU parity run |
+> | `probes.row_attribution` | **port unverified** — needs a GPU parity run |
+> | `probes.precision_cap` (other entry points) | **port unverified** — needs a GPU parity run |
+> | `probes.clip_order` | **port unverified** — needs a GPU parity run |
+> | `probes.integrator` | **port unverified** — needs a GPU parity run |
+> | `probes.tau_saturation.probe_hot_rows` | **port unverified** — ported after the rest; same gap |
+> | `probes.precision_cap.replay_rank_perturbation_control` | **port unverified** — built as the control for the truncation ablation |
 >
-> **Why GPU matters here.** A replay is only meaningful if it reproduces the
-> gradients training actually saw. That was confirmed for the notebook's own
-> `replay_spike_batch` on an A100 (fidelity 0.0002% at step 87196, 0.0003% at
-> 90360) — but a CPU replay of the same bundle does **not** reproduce it, for
-> reasons not yet root-caused. So a green CPU test says nothing about
-> replay correctness.
+> **Why GPU matters for the replay-based rows.** A replay is only meaningful if
+> it reproduces the gradients training actually saw. That was confirmed for the
+> notebook's own `replay_spike_batch` on an A100 (fidelity 0.0002% at step
+> 87196, 0.0003% at 90360) — but a CPU replay of the same bundle does **not**
+> reproduce it, for reasons not yet root-caused. A green CPU test therefore says
+> nothing about replay correctness, and an unverified row above means *"the
+> notebook version of this is trusted; this module has not been shown to match
+> it on GPU"* — not that the diagnostic itself is in doubt.
 >
-> **To verify:** run the verification section at the end of
+> **Open caveat on `probes.resonance` — 2026-09-26.** Although GPU-verified at
+> the steps above, the wall monitor printed
+> `EMPTY SUMMARY -- no substep hook fired` throughout the 2026-09 depth-ladder
+> runs (L=1, L=2 `'none'`, and the conservative-only arm). That is a **missing**
+> diagnostic, not a passing one — the substep hook is not matching the path
+> `baoab_cfc_lowrank` actually calls. Until it is root-caused, resonance output
+> from those runs should be read as absent rather than clean.
+>
+> **To verify a port row:** run the verification section at the end of
 > [`examples/notebooks/semsimula_diag_tour.ipynb`](examples/notebooks/semsimula_diag_tour.ipynb)
 > on a GPU runtime. It checks each replay probe against the known-good values
-> above and prints a pass/fail table. Until that passes, treat every
-> replay-based probe's output as unconfirmed.
+> above and prints a pass/fail table.
 
 ## Install
 

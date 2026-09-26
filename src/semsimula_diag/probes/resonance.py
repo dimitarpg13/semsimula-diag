@@ -222,6 +222,26 @@ def observe(model, integrator_module, *, wall: float = 2.0,
             return original(h, v, f_harm, k_diag, m, dt)
         return _wrapped
 
+    def _wrap_lowrank_substep(original):
+        """``integrator='baoab_cfc_lowrank'`` calls this INSTEAD of
+        ``cfc_substep``, so without patching it the monitor's hooks never
+        close and ``summary()`` returns empty -- which a caller guarding on
+        ``if summary:`` reports as silence rather than as a failure.
+
+        Note what the number means here. Under ``baoab_cfc_lowrank`` the
+        low-rank modes are integrated EXACTLY, so ``omega*dt`` is no longer
+        a stability wall for them: it is a stiffness reading. A large value
+        says explicit integration WOULD have been unstable and the exact
+        flow is doing real work, not that the run is in danger. What stays
+        explicit under this integrator -- ``V_phi``'s pair force and any
+        relaxation kick -- is not harmonic and this probe does not see it,
+        so there is no stability check for those from here.
+        """
+        def _wrapped(h, v, U, kappa, f_lr, m, dt):
+            mon._finish(m, float(dt))
+            return original(h, v, U, kappa, f_lr, m, dt)
+        return _wrapped
+
     def _wrap_layer(original):
         def _wrapped(h, h_prev, r, salience, m_b, gamma, dt, layer_idx,
                      *a, **kw):
@@ -234,7 +254,10 @@ def observe(model, integrator_module, *, wall: float = 2.0,
                 if hasattr(model, "_fock_layer_step")
                 else contextlib.nullcontext())
     with patched_attrs(vt, {"harmonic_terms": _wrap_harmonic}):
-        with patched_attrs(integrator_module, {"cfc_substep": _wrap_substep}):
+        _substeps = {"cfc_substep": _wrap_substep}
+        if hasattr(integrator_module, "lowrank_cfc_substep"):
+            _substeps["lowrank_cfc_substep"] = _wrap_lowrank_substep
+        with patched_attrs(integrator_module, _substeps):
             with layer_cm:
                 yield mon
 

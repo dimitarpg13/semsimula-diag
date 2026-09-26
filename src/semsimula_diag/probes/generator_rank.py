@@ -291,6 +291,17 @@ def allocation_from_energy(
     uncapped allocation can ask for a "saving" that is really an expansion;
     the cap turns it into the best faithful allocation that is still a
     saving, and the printed table marks which maps were clamped.
+
+    **This is a diagnostic, not a recommended allocation.** Measured at the
+    d=384 step-28,500 checkpoint, ``fraction=0.99`` with the cap on spends
+    31.15M of 35.39M -- 88% of the generator -- to buy a loss 0.25 ppl
+    better than a hand-picked mixed allocation costing 20.94M. That is
+    about 41M parameters per ppl, roughly three times the marginal rate of
+    anything else on the frontier. The reason is structural rather than a
+    bad choice of ``fraction``: an SVD spectrum ranks directions by their
+    contribution to the **Frobenius norm**, and Frobenius fidelity is not
+    what a language model is buying. Use this to report what fidelity would
+    cost, then choose the allocation with ``per_map_truncation``.
     """
     spec = generator_spectrum(ctx, fractions=(fraction,), verbose=False)
     params = _generator_params(ctx.model)

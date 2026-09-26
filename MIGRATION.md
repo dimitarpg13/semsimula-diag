@@ -65,14 +65,34 @@ So the 1441:1 generate-to-use ratio does **not** mean the generator's
 parameters are idle. They carry loss, monotonically. Rank 1024 is the one
 cheap operating point -- 30% of the generator removed for +0.3% ppl.
 
-**Why `per_map_truncation` exists.** `a_proj` reaches 90% of its energy by
-rank 242 while `B_proj` needs 707, so the uniform sweep is still gutting
-`B_proj` at ranks where `a_proj` is nearly intact. A mixed allocation
-(`B_proj`/`mu_proj` at 1024, `a_proj` at 256) costs 20.94M against uniform
-1024's 24.77M -- 3.83M more saved at what should be near-identical loss.
-`allocation_from_energy` builds such an allocation from the measured
-spectrum, and `cap_at_break_even=True` clamps each map to `mn/(m+n)` so an
-allocation cannot ask for an expansion and report it as a saving.
+**Why `per_map_truncation` exists, and what it measured.** `a_proj` reaches
+90% of its energy by rank 242 while `B_proj` needs 707, so the uniform
+sweep is still gutting `B_proj` at ranks where `a_proj` is nearly intact. On
+the same 12 fixed batches:
+
+| allocation | params | of generator | d ppl |
+| --- | ---: | ---: | ---: |
+| uniform r = 1024 | 24.77M | 70.0% | +0.29 |
+| mixed `B`/`mu` 1024, `a` 256 | 20.94M | 59.2% | +0.30 |
+| mixed `B`/`mu` 1024, `a` 64 | 19.98M | 56.5% | +0.37 |
+| 99% energy, capped | 31.15M | 88.0% | +0.05 |
+
+3.83M fewer parameters for +0.01 ppl. The knee does not move, though:
+`a_proj` is 5.9M of 35.4M and 256 to 64 costs only +0.07, so the uniform
+numbers were always essentially `B_proj` and `mu_proj`'s numbers.
+
+**Energy retention is the wrong objective, and this is the evidence.** The
+`99% energy, capped` row is not dominated -- nothing measured has both
+fewer parameters and a smaller loss -- so it is Pareto-optimal and should
+not be called otherwise. It is simply a bad buy: 10.2M parameters for 0.25
+ppl, about 41M per ppl, against a mixed-to-uniform step that moves 3.83M
+for 0.01. The cause is structural, not a bad `fraction`: an SVD spectrum
+ranks directions by contribution to the **Frobenius norm**, which is not
+what a language model is buying. `cap_at_break_even=True` prevents an
+allocation asking for an outright expansion -- `mu_proj` was clamped from
+1483 to 1181 -- but nothing prevents it overspending. `allocation_from_energy`
+is therefore documented as a diagnostic reporting what fidelity would cost,
+not as a recommended allocation; choose with `per_map_truncation`.
 
 ---
 
