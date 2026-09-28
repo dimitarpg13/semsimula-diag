@@ -21,6 +21,14 @@ eigenvalue is wanted, and that comes from power iteration using nothing but
 matvecs ``L v = G (G^T v)`` -- no eigensolver, no cuSOLVER, GPU-friendly
 matmuls only.
 
+**The hooks come in pairs: one opens a record, one closes it.** Which pair
+fires depends on the integrator. ``baoab_cfc`` opens on ``harmonic_terms``
+and closes on ``cfc_substep``; ``baoab_cfc_lowrank`` opens on
+``harmonic_terms_lowrank`` and closes on ``lowrank_cfc_substep``, and never
+touches the first pair at all. Patching a close without its open is silent:
+``_finish`` returns early when nothing is pending, and ``summary()`` comes
+back empty.
+
 **The two hooks.** ``harmonic_terms`` is what the ``baoab_cfc`` path calls,
 and it receives exactly the ``(xis, h)`` the layer linearises at; calling
 ``harmonic_terms_lowrank`` on the same inputs reconstructs the ``G`` the
@@ -206,13 +214,43 @@ def observe(model, integrator_module, *, wall: float = 2.0,
             "the anisotropic Gaussian family.")
     mon = ResonanceMonitor(wall=wall)
 
+    # Captured BEFORE patching. `_wrap_harmonic` reconstructs G by calling
+    # `harmonic_terms_lowrank`, which is itself patched below; routing the
+    # inner call through the original keeps the dense path at one power
+    # iteration per layer instead of two, and stops the wrappers nesting.
+    _orig_lowrank = vt.harmonic_terms_lowrank
+
     def _wrap_harmonic(original):
+        """The `baoab_cfc` path: the diagonal spring goes through
+        `harmonic_terms`, and G has to be reconstructed separately."""
         def _wrapped(xis, h, *, comps=None):
             out = original(xis, h, comps=comps)
             with torch.no_grad():
-                _, _, G, _ = vt.harmonic_terms_lowrank(xis, h, comps=comps)
+                _, _, G, _ = _orig_lowrank(xis, h, comps=comps)
                 if G.shape[-1]:
                     mon._stash(_lambda_max(G, n_power_iter, seed))
+            return out
+        return _wrapped
+
+    def _wrap_harmonic_lowrank(original):
+        """The `baoab_cfc_lowrank` path, which never calls `harmonic_terms`.
+
+        This is the half of the low-rank fix that OPENS a record; patching
+        `lowrank_cfc_substep` only closes one, and a close with nothing
+        pending is a silent no-op (see `ResonanceMonitor._finish`). Without
+        this wrapper `summary()` returns empty on every low-rank run, which
+        a caller guarding on `if summary:` reports as silence rather than as
+        a missing diagnostic.
+
+        Free, unlike `_wrap_harmonic`: G is already the third element of
+        what this method returns, so nothing is recomputed.
+        """
+        def _wrapped(xis, h, *, comps=None):
+            out = original(xis, h, comps=comps)
+            with torch.no_grad():
+                G = out[2]
+                if G.shape[-1]:
+                    mon._stash(_lambda_max(G.detach(), n_power_iter, seed))
             return out
         return _wrapped
 
@@ -253,7 +291,8 @@ def observe(model, integrator_module, *, wall: float = 2.0,
     layer_cm = (patched_attrs(model, {"_fock_layer_step": _wrap_layer})
                 if hasattr(model, "_fock_layer_step")
                 else contextlib.nullcontext())
-    with patched_attrs(vt, {"harmonic_terms": _wrap_harmonic}):
+    with patched_attrs(vt, {"harmonic_terms": _wrap_harmonic,
+                            "harmonic_terms_lowrank": _wrap_harmonic_lowrank}):
         _substeps = {"cfc_substep": _wrap_substep}
         if hasattr(integrator_module, "lowrank_cfc_substep"):
             _substeps["lowrank_cfc_substep"] = _wrap_lowrank_substep
