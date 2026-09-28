@@ -601,3 +601,99 @@ def test_precision_cap_probes_survive_the_joint_bank_shape(tmp_path):
 
     tail = resonance.tail_coherence_report(ctx, 42, verbose=False)
     assert tail.metrics["tail_pr_p50"] >= 1.0
+
+
+# --- the low-rank integrator path ---------------------------------------
+#
+# REGRESSION (2026-09-28). `integrator='baoab_cfc_lowrank'` never calls
+# `harmonic_terms`; it calls `harmonic_terms_lowrank` and `lowrank_cfc_substep`.
+# `observe()` patched the substep (so a record could CLOSE) but opened its
+# record only in the `harmonic_terms` wrapper, so nothing was ever stashed,
+# `_finish` returned early every time, and `summary()` came back empty --
+# which a caller guarding on `if summary:` reports as silence rather than as
+# a failure. Every low-rank run was therefore unmonitored.
+
+class _ToyLowrankIntegratorModule:
+    """The low-rank path: `lowrank_cfc_substep` INSTEAD of `cfc_substep`."""
+    @staticmethod
+    def cfc_substep(h, v, f_harm, k_diag, m, dt):     # never called here
+        raise AssertionError("the low-rank path must not call cfc_substep")
+
+    @staticmethod
+    def lowrank_cfc_substep(h, v, U, kappa, f_lr, m, dt):
+        return h, v
+
+
+class _ToyLowrankModel(nn.Module):
+    """Mirrors `_layer_step_langevin`'s low-rank branch: it linearises with
+    `harmonic_terms_lowrank` and steps with `lowrank_cfc_substep`, and never
+    touches `harmonic_terms`."""
+
+    def __init__(self, scale=1.0, n_layers=2, mass=1.0, dt_substep=0.5):
+        super().__init__()
+        self.emb = nn.Embedding(16, 6)
+        self.V_theta = _ToyVTheta(scale=scale)
+        self.head = nn.Linear(6, 16)
+        self.n_layers, self.mass, self.dt_substep = n_layers, mass, dt_substep
+
+    def forward(self, x):
+        h = self.emb(x)
+        for _ in range(self.n_layers):
+            comps = self.V_theta.context_components(h)
+            k, s, G, Gmu = self.V_theta.harmonic_terms_lowrank(h, h, comps=comps)
+            h, _ = _ToyLowrankIntegratorModule.lowrank_cfc_substep(
+                h, h, G, k, Gmu, torch.tensor(self.mass), self.dt_substep)
+        return self.head(h)
+
+
+def test_monitor_records_under_the_lowrank_integrator():
+    """The regression itself: a forward that only ever touches the low-rank
+    hooks must still produce a summary."""
+    torch.manual_seed(0)
+    model = _ToyLowrankModel()
+    x = torch.randint(0, 16, (2, 5))
+    with resonance.observe(model, _ToyLowrankIntegratorModule) as mon:
+        model(x)
+    s = mon.summary()
+    assert s, "empty summary: the low-rank path opened no record"
+    assert set(s["per_layer"]) == {0, 1}
+    assert s["overall"]["max"] > 0
+
+
+def test_lowrank_omega_dt_scales_with_the_factor():
+    """Same physics as the dense path: omega ~ ||B||, so doubling the
+    low-rank factor doubles omega*dt. Guards against the hook stashing
+    something that merely happens to be non-empty."""
+    def run(scale):
+        torch.manual_seed(0)
+        model = _ToyLowrankModel(scale=scale)
+        x = torch.randint(0, 16, (2, 5))
+        with resonance.observe(model, _ToyLowrankIntegratorModule) as mon:
+            model(x)
+        return mon.summary()["overall"]["max"]
+    assert run(2.0) == pytest.approx(2.0 * run(1.0), rel=1e-4)
+
+
+def test_dense_path_stashes_once_not_twice():
+    """`_wrap_harmonic` reconstructs G by calling `harmonic_terms_lowrank`.
+    Now that that method is patched too, the inner call must reach the
+    ORIGINAL -- otherwise the dense path pays for two power iterations per
+    layer and the wrappers nest."""
+    torch.manual_seed(0)
+    model = _ToyModel()
+    calls = {"n": 0}
+    original = type(model.V_theta).harmonic_terms_lowrank
+
+    def counting(self, xis, h, *, comps=None):
+        calls["n"] += 1
+        return original(self, xis, h, comps=comps)
+
+    type(model.V_theta).harmonic_terms_lowrank = counting
+    try:
+        x = torch.randint(0, 16, (2, 5))
+        with resonance.observe(model, _FakeIntegratorModule) as mon:
+            model(x)
+        assert mon.summary()
+        assert calls["n"] == model.n_layers, calls["n"]
+    finally:
+        type(model.V_theta).harmonic_terms_lowrank = original
