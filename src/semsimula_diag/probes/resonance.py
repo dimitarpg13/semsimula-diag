@@ -24,7 +24,8 @@ matmuls only.
 **The hooks come in pairs: one opens a record, one closes it.** Which pair
 fires depends on the integrator. ``baoab_cfc`` opens on ``harmonic_terms``
 and closes on ``cfc_substep``; ``baoab_cfc_lowrank`` opens on
-``harmonic_terms_lowrank`` and closes on ``lowrank_cfc_substep``, and never
+``harmonic_terms_lowrank`` and closes on ``lowrank_cfc_substep`` (or, with
+SR2's ``lowrank_damped_flow``, on ``lowrank_damped_substep``), and never
 touches the first pair at all. Patching a close without its open is silent:
 ``_finish`` returns early when nothing is pending, and ``summary()`` comes
 back empty.
@@ -280,6 +281,19 @@ def observe(model, integrator_module, *, wall: float = 2.0,
             return original(h, v, U, kappa, f_lr, m, dt)
         return _wrapped
 
+    def _wrap_lowrank_damped_substep(original):
+        """SR2 (``lowrank_damped_flow=True``) calls this INSTEAD of
+        ``lowrank_cfc_substep``: the same exact flow on span(U), with the
+        friction integrated inside it. ``harmonic_terms_lowrank`` still opens
+        the record, so without this close every SR2 run reported an empty
+        summary. ``omega*dt`` is the same stiffness reading as under
+        ``lowrank_cfc_substep`` (the undamped frequency of the top mode).
+        """
+        def _wrapped(h, v, U, kappa, f_lr, m, gamma, dt):
+            mon._finish(m, float(dt))
+            return original(h, v, U, kappa, f_lr, m, gamma, dt)
+        return _wrapped
+
     def _wrap_layer(original):
         def _wrapped(h, h_prev, r, salience, m_b, gamma, dt, layer_idx,
                      *a, **kw):
@@ -296,6 +310,8 @@ def observe(model, integrator_module, *, wall: float = 2.0,
         _substeps = {"cfc_substep": _wrap_substep}
         if hasattr(integrator_module, "lowrank_cfc_substep"):
             _substeps["lowrank_cfc_substep"] = _wrap_lowrank_substep
+        if hasattr(integrator_module, "lowrank_damped_substep"):
+            _substeps["lowrank_damped_substep"] = _wrap_lowrank_damped_substep
         with patched_attrs(integrator_module, _substeps):
             with layer_cm:
                 yield mon

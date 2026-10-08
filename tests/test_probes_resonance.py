@@ -674,6 +674,54 @@ def test_lowrank_omega_dt_scales_with_the_factor():
     assert run(2.0) == pytest.approx(2.0 * run(1.0), rel=1e-4)
 
 
+# REGRESSION (2026-10-08). SR2 (`lowrank_damped_flow=True`) replaces
+# `lowrank_cfc_substep` with `lowrank_damped_substep`, which takes an extra
+# `gamma`. The record opened in `harmonic_terms_lowrank` never closed, and the
+# SR2-on-F3.1 run printed EMPTY SUMMARY at its first resonance check.
+
+class _ToyDampedIntegratorModule:
+    """SR2's path: `lowrank_damped_substep` INSTEAD of `lowrank_cfc_substep`."""
+    @staticmethod
+    def cfc_substep(h, v, f_harm, k_diag, m, dt):
+        raise AssertionError("the low-rank path must not call cfc_substep")
+
+    @staticmethod
+    def lowrank_cfc_substep(h, v, U, kappa, f_lr, m, dt):
+        raise AssertionError("SR2 must not call lowrank_cfc_substep")
+
+    @staticmethod
+    def lowrank_damped_substep(h, v, U, kappa, f_lr, m, gamma, dt):
+        return h, v
+
+
+class _ToyDampedModel(_ToyLowrankModel):
+    def forward(self, x):
+        h = self.emb(x)
+        for _ in range(self.n_layers):
+            comps = self.V_theta.context_components(h)
+            k, s, G, Gmu = self.V_theta.harmonic_terms_lowrank(h, h, comps=comps)
+            h, _ = _ToyDampedIntegratorModule.lowrank_damped_substep(
+                h, h, G, k, Gmu, torch.tensor(self.mass), 0.1, self.dt_substep)
+        return self.head(h)
+
+
+def test_monitor_records_under_the_sr2_damped_substep():
+    """Same omega*dt as the undamped low-rank path on the same model: the
+    reading is the undamped frequency, and gamma does not enter it."""
+    def run(model_cls, module):
+        torch.manual_seed(0)
+        model = model_cls()
+        x = torch.randint(0, 16, (2, 5))
+        with resonance.observe(model, module) as mon:
+            model(x)
+        return mon.summary()
+    s = run(_ToyDampedModel, _ToyDampedIntegratorModule)
+    assert s, "empty summary: the SR2 substep closed no record"
+    assert set(s["per_layer"]) == {0, 1}
+    ref = run(_ToyLowrankModel, _ToyLowrankIntegratorModule)
+    assert s["overall"]["max"] == pytest.approx(ref["overall"]["max"], rel=1e-6)
+
+
 def test_dense_path_stashes_once_not_twice():
     """`_wrap_harmonic` reconstructs G by calling `harmonic_terms_lowrank`.
     Now that that method is patched too, the inner call must reach the
