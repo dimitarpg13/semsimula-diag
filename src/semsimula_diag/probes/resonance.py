@@ -294,6 +294,18 @@ def observe(model, integrator_module, *, wall: float = 2.0,
             return original(h, v, U, kappa, f_lr, m, gamma, dt)
         return _wrapped
 
+    def _wrap_lowrank_iso_damped_substep(original):
+        """PMX (``poisson_wells_exact=True``) calls this INSTEAD of
+        ``lowrank_damped_substep``: the exact damped flow on all of R^d, with
+        the Poisson-mode wells' quadratic folded in. ``harmonic_terms_lowrank``
+        still opens the record, so the reading is Vtheta's stiffness, as under
+        SR2; the wells' own curvature is not part of it.
+        """
+        def _wrapped(h, v, U, kappa, alpha, f, m, gamma, dt):
+            mon._finish(m, float(dt))
+            return original(h, v, U, kappa, alpha, f, m, gamma, dt)
+        return _wrapped
+
     def _wrap_layer(original):
         def _wrapped(h, h_prev, r, salience, m_b, gamma, dt, layer_idx,
                      *a, **kw):
@@ -312,6 +324,8 @@ def observe(model, integrator_module, *, wall: float = 2.0,
             _substeps["lowrank_cfc_substep"] = _wrap_lowrank_substep
         if hasattr(integrator_module, "lowrank_damped_substep"):
             _substeps["lowrank_damped_substep"] = _wrap_lowrank_damped_substep
+        if hasattr(integrator_module, "lowrank_iso_damped_substep"):
+            _substeps["lowrank_iso_damped_substep"] = _wrap_lowrank_iso_damped_substep
         with patched_attrs(integrator_module, _substeps):
             with layer_cm:
                 yield mon

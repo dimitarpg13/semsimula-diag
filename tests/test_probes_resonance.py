@@ -722,6 +722,56 @@ def test_monitor_records_under_the_sr2_damped_substep():
     assert s["overall"]["max"] == pytest.approx(ref["overall"]["max"], rel=1e-6)
 
 
+# REGRESSION (2026-10-11). PMX (`poisson_wells_exact=True`) steps with
+# `lowrank_iso_damped_substep`, which takes alpha and gamma; the PMX probe's
+# monitor was empty for all 8,000 steps.
+
+class _ToyIsoIntegratorModule:
+    """PMX's path: `lowrank_iso_damped_substep` instead of the other substeps."""
+    @staticmethod
+    def cfc_substep(h, v, f_harm, k_diag, m, dt):
+        raise AssertionError("the low-rank path must not call cfc_substep")
+
+    @staticmethod
+    def lowrank_cfc_substep(h, v, U, kappa, f_lr, m, dt):
+        raise AssertionError("PMX must not call lowrank_cfc_substep")
+
+    @staticmethod
+    def lowrank_damped_substep(h, v, U, kappa, f_lr, m, gamma, dt):
+        raise AssertionError("PMX must not call lowrank_damped_substep")
+
+    @staticmethod
+    def lowrank_iso_damped_substep(h, v, U, kappa, alpha, f, m, gamma, dt):
+        return h, v
+
+
+class _ToyIsoModel(_ToyLowrankModel):
+    def forward(self, x):
+        h = self.emb(x)
+        for _ in range(self.n_layers):
+            comps = self.V_theta.context_components(h)
+            k, s, G, Gmu = self.V_theta.harmonic_terms_lowrank(h, h, comps=comps)
+            h, _ = _ToyIsoIntegratorModule.lowrank_iso_damped_substep(
+                h, h, G, k, torch.zeros(1), Gmu, torch.tensor(self.mass), 0.1, self.dt_substep)
+        return self.head(h)
+
+
+def test_monitor_records_under_the_pmx_substep():
+    """Vtheta's omega*dt, as under the other low-rank substeps."""
+    def run(model_cls, module):
+        torch.manual_seed(0)
+        model = model_cls()
+        x = torch.randint(0, 16, (2, 5))
+        with resonance.observe(model, module) as mon:
+            model(x)
+        return mon.summary()
+    s = run(_ToyIsoModel, _ToyIsoIntegratorModule)
+    assert s, "empty summary: the PMX substep closed no record"
+    assert set(s["per_layer"]) == {0, 1}
+    ref = run(_ToyLowrankModel, _ToyLowrankIntegratorModule)
+    assert s["overall"]["max"] == pytest.approx(ref["overall"]["max"], rel=1e-6)
+
+
 def test_dense_path_stashes_once_not_twice():
     """`_wrap_harmonic` reconstructs G by calling `harmonic_terms_lowrank`.
     Now that that method is patched too, the inner call must reach the
